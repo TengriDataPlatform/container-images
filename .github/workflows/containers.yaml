@@ -1,0 +1,89 @@
+# kics-scan disable=555ab8f9-2001-455e-a077-f2d0f41e2fb9
+---
+name: containers
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  schedule:
+    - cron: "1 1 * * 4"
+jobs:
+  define-matrix:
+    name: define matrix
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.define-matrix.outputs.images }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: true
+      - name: define matrix
+        id: define-matrix
+        run: |
+          source _shared/_all/matrix.sh
+          echo "images=${DIR_SON}" >> "${GITHUB_OUTPUT}"
+  containers:
+    name: "build ${{ matrix.image }} container"
+    needs: define-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.define-matrix.outputs.images) }}
+    timeout-minutes: 22
+    runs-on: ubuntu-24.04
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          submodules: recursive
+      - name: patch IMAGE_VER for pull request
+        if: github.event_name == 'pull_request'
+        run: >
+          sed -i "s/IMAGE_VER='[^']*'/IMAGE_VER='999'/"
+          "sources/${{ matrix.image }}/vars.sh"
+      - name: build and test images
+        run: |
+          sudo ./podman.sh
+          MANUAL_IMAGES_DIRS='${{ matrix.image }}/' _shared/_all/build.sh
+      - name: login to ghcr
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.REGISTRY_WRITER }}
+      - name: push images
+        run: MANUAL_IMAGES_DIRS='${{ matrix.image }}/' _shared/_all/push.sh
+  MegaLinter:
+    name: MegaLinter
+    timeout-minutes: 11
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: true
+      - name: MegaLinter
+        uses: oxsecurity/megalinter@v9
+        env:
+          VALIDATE_ALL_CODEBASE: true
+  all-green:
+    name: all green
+    timeout-minutes: 3
+    runs-on: ubuntu-latest
+    needs:
+      - containers
+      - MegaLinter
+    if: github.event_name == 'pull_request'
+    permissions:
+      checks: read
+    steps:
+      - name: waiting for checks success
+        uses: poseidon/wait-for-status-checks@v0.6.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: all green, foobar
+          timeout: 111s
