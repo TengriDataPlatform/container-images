@@ -46,6 +46,8 @@ jobs:
           sed -i "s/IMAGE_VER='[^']*'/IMAGE_VER='999'/"
           "sources/${{ matrix.image }}/vars.sh"
       - name: build and test images
+        env:
+          TENGRI_INFRA_READ_PAT: ${{ secrets.TENGRI_INFRA_READ_PAT }}
         run: |
           sudo ./podman.sh
           MANUAL_IMAGES_DIRS='${{ matrix.image }}/' _shared/_all/build.sh
