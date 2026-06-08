@@ -1,0 +1,31 @@
+--- a/python-env.Dockerfile	2026-06-10 08:40:01.240432552 +0000
++++ b/python-env.Dockerfile	2026-06-11 10:09:59.233300857 +0000
+@@ -3,8 +3,6 @@
+ ARG APT_SOURCE_MAIN=deb.debian.org
+ ARG APT_SOURCE_SECURITY=security.debian.org
+ ARG APT_MIRROR=mirror.yandex.ru
+-RUN files=$(grep -rlFI -e "${APT_SOURCE_MAIN}" -e "${APT_SOURCE_SECURITY}" /etc/apt/) && [ -n "$files" ] && \
+-    echo "$files" | xargs sed -i "s|${APT_SOURCE_MAIN}|${APT_MIRROR}|g; s|${APT_SOURCE_SECURITY}|${APT_MIRROR}|g"
+ 
+ ARG UID
+ ARG GID
+@@ -23,16 +21,12 @@
+     libgssapi-krb5-2 \
+     && rm -rf /var/lib/apt/lists/*
+ 
+-RUN groupadd -f --gid ${GID} python && \
+-    useradd --create-home --uid ${UID} --gid ${GID} python && \
+-    install -d -o python -g python -m 0700 /home/python/.ssh
+-
+-RUN chmod 1777 /tmp
+-RUN chmod 1777 /home/python
++COPY files/ /files/
++RUN /files/install.sh
+ 
+ RUN pip install --no-cache-dir --index-url "$PIP_INDEX_URL" python-lsp-server==1.12.2
+ 
+-USER python
++USER root
+ WORKDIR /home/python
+ 
+ # Pre-bakes the e2e shared venv at its *runtime* path so shebangs stay
