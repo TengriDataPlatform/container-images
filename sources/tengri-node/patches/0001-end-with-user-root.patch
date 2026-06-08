@@ -1,0 +1,26 @@
+--- a/node-env.Dockerfile
++++ b/node-env.Dockerfile
+@@ -3,18 +3,17 @@
+ ARG APT_SOURCE_MAIN=deb.debian.org
+ ARG APT_SOURCE_SECURITY=security.debian.org
+ ARG APT_MIRROR=mirror.yandex.ru
+-RUN files=$(grep -rlFI -e "${APT_SOURCE_MAIN}" -e "${APT_SOURCE_SECURITY}" /etc/apt/) && [ -n "$files" ] && \
+-    echo "$files" | xargs sed -i "s|${APT_SOURCE_MAIN}|${APT_MIRROR}|g; s|${APT_SOURCE_SECURITY}|${APT_MIRROR}|g"
+-
+ ARG UID
+ ARG GID
+ 
+-RUN groupadd -f --gid ${GID} nodejs && \
+-    useradd --create-home --uid ${UID} --gid ${GID} nodejs
+-
++RUN mkdir -p /home/nodejs
+ RUN chmod 1777 /tmp
+ RUN chmod 1777 /home/nodejs
+ 
+-USER nodejs
++RUN mv /usr/bin/apt-get /usr/bin/apt-get.real && \
++    printf '#!/bin/sh\nif [ "$1" = "update" ]; then\n  /usr/bin/apt-get.real "$@" || true\nelse\n  exec /usr/bin/apt-get.real "$@"\nfi\n' \
++      > /usr/bin/apt-get && \
++    chmod 0755 /usr/bin/apt-get
++USER root
+ WORKDIR /home/nodejs
