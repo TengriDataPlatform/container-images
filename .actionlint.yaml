@@ -1,0 +1,6 @@
+---
+self-hosted-runner:
+  labels:
+    - debian13
+    - tests
+    - build
