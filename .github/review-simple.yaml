@@ -18,7 +18,7 @@ llm:
   meta:
     # --- OpenAI ---
     model: ${LLM_API_MODEL}
-    max_tokens: 77777 # (optional) Maximum tokens for completion
+    max_tokens: 111111 # (optional) Maximum tokens for completion
     temperature: 0.3 # (optional) Creativity of responses (0 = deterministic)
     stream: true
 
@@ -79,7 +79,7 @@ llm:
     # Optional HTTP/HTTPS proxy URL for connecting to the LLM provider.
     # Useful when your server cannot reach the provider directly (e.g. behind a firewall).
     # Examples:
-    proxy_url: ${HTTP_PROXY}
+    # proxy_url: ${HTTP_PROXY}
 
     # --- Gemini ---
     # api_url: https://generativelanguage.googleapis.com
@@ -168,7 +168,7 @@ vcs:
     # --- Proxy ---
     # Optional HTTP/HTTPS proxy URL for connecting to the VCS provider.
     # Useful when the server cannot reach the VCS API directly (e.g. behind a firewall).
-    proxy_url: ${HTTP_PROXY}
+    # proxy_url: ${HTTP_PROXY}
 
     # --- GitLab ---
     # api_url: ${CI_SERVER_URL} # Base GitLab server URL
