@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 set -ueo pipefail
-export IMAGE_VER='001'
-mkdir -p "sources/${TAG}/_shared"
+# shellcheck disable=2034
+{
+  IMAGE_VER='001'
+  SHARED_ASSETS=()
+}
+stage_shared_assets
 _upstream="sources/${TAG}/_shared/upstream"
 _pat="${TENGRI_INFRA_READ_PAT:-}"
 _repo_url="https://${_pat:+${_pat}@}github.com/TengriDataPlatform/tengri.git"
 checkout_upstream "${_repo_url}" master "${_upstream}"
 _dockerfile="${_upstream}/python-env.Dockerfile"
 # shellcheck disable=2153
-for _patch in "${IMAGE_DIR}/patches/"*.patch; do
+[[ -z "${PUSHING:-}" ]] && for _patch in "${IMAGE_DIR}/patches/"*.patch; do
   [[ -f "${_patch}" ]] || continue
   echo "applying ${_patch}"
   if ! patch -d "${_upstream}" -p1 <"${_patch}"; then

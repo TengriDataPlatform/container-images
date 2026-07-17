@@ -13,11 +13,16 @@ for IMAGE_DIR in "${IMAGES_DIRS[@]}"; do
   TAG=${IMAGE_DIR//sources\//}
   echo
   echo "pushing [${TAG}] from [${IMAGE_DIR}] dir…"
+  eval "$(_build_vars_shunts "${IMAGE_DIR}/vars.sh")"
+  # shellcheck disable=2034
+  PUSHING=1
   # shellcheck source=/dev/null
   source "${IMAGE_DIR}/vars.sh"
   current_date="$(/usr/bin/env date '+%Y%m%d')"
-  /usr/bin/env podman push "${TARGET_REGISTRY}/${TAG}:latest"
-  /usr/bin/env podman push "${TARGET_REGISTRY}/${TAG}:${current_date}"
+  if [[ "${IMAGE_VER}" != "999" ]]; then
+    /usr/bin/env podman push "${TARGET_REGISTRY}/${TAG}:latest"
+    /usr/bin/env podman push "${TARGET_REGISTRY}/${TAG}:${current_date}"
+  fi
   /usr/bin/env podman push "${TARGET_REGISTRY}/${TAG}:${IMAGE_VER}"
   /usr/bin/env podman push "${TARGET_REGISTRY}/${TAG}:${IMAGE_VER}-${current_date}"
   /usr/bin/env podman image rm -f \

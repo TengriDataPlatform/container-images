@@ -8,6 +8,9 @@ on:
   pull_request:
   schedule:
     - cron: "1 1 * * *"
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   define-matrix:
     name: define matrix
@@ -21,12 +24,15 @@ jobs:
           submodules: true
       - name: define matrix
         id: define-matrix
+        env:
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
         run: |
           source _shared/_all/matrix.sh
           echo "images=${DIR_SON}" >> "${GITHUB_OUTPUT}"
   containers:
     name: "build ${{ matrix.image }} container"
     needs: define-matrix
+    if: needs.define-matrix.outputs.images != '[]'
     strategy:
       fail-fast: false
       matrix:

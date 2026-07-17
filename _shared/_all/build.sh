@@ -29,6 +29,8 @@ for IMAGE_DIR in "${IMAGES_DIRS[@]}"; do
   /usr/bin/env podman build \
     --network host \
     --build-arg TAG="${TAG}" \
+    --build-arg PYTHON_VERSION="${PYTHON_VERSION}" \
+    --build-arg PYENV_ROOT="${PYENV_ROOT}" \
     --cap-add=MAC_ADMIN,SYS_ADMIN \
     --security-opt apparmor=unconfined \
     -t "${lh_var}/${TAG}:local" \
