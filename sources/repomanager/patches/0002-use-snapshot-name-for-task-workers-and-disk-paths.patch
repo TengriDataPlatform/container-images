@@ -1,0 +1,512 @@
+--- a/www/controllers/Repo/Package/Sync.php
++++ b/www/controllers/Repo/Package/Sync.php
+@@ -50,21 +50,14 @@
+             }
+ 
+             /**
+-             *  We can update a snapshot in the same day, but we can't update another snapshot if a snapshot at the current date already exists
+-             *
+-             *  So if the snapshot date being updated == today's date ($this->repoController->getDate()) then the task can continue
+-             *  Else we check that another snapshot at the current date does not already exist, if it does we quit
++             *  We can update a snapshot in place (same on-disk name), but a
++             *  brand new snapshot must not collide with an existing one.
++             *  With named snapshots the identity is the full snapshot name
++             *  (Y-m-d or Y-m-d_suffix), so two names with the same date are OK.
+              */
+-            if ($this->repoSnapshotController->getDateById($this->repoController->getSnapId()) != $this->repoController->getDate()) {
+-                if ($this->repoController->getPackageType() == 'rpm') {
+-                    if ($this->rpmRepoController->existsSnapDate($this->repoController->getName(), $this->repoController->getReleasever(), $this->repoController->getDate())) {
+-                        throw new Exception('A snapshot already exists on the ' . Label::black($this->repoController->getDateFormatted()));
+-                    }
+-                }
+-                if ($this->repoController->getPackageType() == 'deb') {
+-                    if ($this->debRepoController->existsSnapDate($this->repoController->getName(), $this->repoController->getDist(), $this->repoController->getSection(), $this->repoController->getDate())) {
+-                        throw new Exception('A snapshot already exists on the ' . Label::black($this->repoController->getDateFormatted()));
+-                    }
++            if ($this->repoSnapshotController->getNameById($this->repoController->getSnapId()) != $this->repoController->getSnapshotName()) {
++                if ($this->repoSnapshotController->existsName($this->repoController->getRepoId(), $this->repoController->getSnapshotName())) {
++                    throw new Exception('A snapshot named ' . Label::black($this->repoController->getSnapshotName()) . ' already exists for this repository');
+                 }
+             }
+         }
+@@ -80,11 +73,12 @@
+          *  If the task is an update, retrieve previous snapshot directory path
+          */
+         if ($this->action == 'update') {
++            // On-disk name comes from repos_snap.Name (falls back to Date for legacy rows)
+             if ($this->sourceRepoController->getPackageType() == 'rpm') {
+-                $previousSnapshotDir = REPOS_DIR . '/rpm/' . $this->sourceRepoController->getName() . '/' . $this->sourceRepoController->getReleasever() . '/' . $this->sourceRepoController->getDate();
++                $previousSnapshotDir = REPOS_DIR . '/rpm/' . $this->sourceRepoController->getName() . '/' . $this->sourceRepoController->getReleasever() . '/' . $this->sourceRepoController->getSnapshotName();
+             }
+             if ($this->sourceRepoController->getPackageType() == 'deb') {
+-                $previousSnapshotDir = REPOS_DIR . '/deb/' . $this->sourceRepoController->getName() . '/' . $this->sourceRepoController->getDist() . '/' . $this->sourceRepoController->getSection() . '/' . $this->sourceRepoController->getDate();
++                $previousSnapshotDir = REPOS_DIR . '/deb/' . $this->sourceRepoController->getName() . '/' . $this->sourceRepoController->getDist() . '/' . $this->sourceRepoController->getSection() . '/' . $this->sourceRepoController->getSnapshotName();
+             }
+ 
+             /**
+--- a/www/controllers/Repo/Task/Create.php
++++ b/www/controllers/Repo/Task/Create.php
+@@ -73,10 +73,16 @@
+     private function mirror()
+     {
+         /**
+-         *  Define the date and time of the new mirror snapshot
++         *  Define the date and time of the new mirror snapshot.
++         *  When a snapshot-name was supplied by the user, keep it as-is;
++         *  otherwise default to today's date (identical to the historical layout).
+          */
+         $this->repoController->setDate(date('Y-m-d'));
+         $this->repoController->setTime(date('H:i'));
++        if (!empty($this->params['snapshot-name'])) {
++            \Controllers\Repo\Snapshot\Snapshot::validateName($this->params['snapshot-name']);
++            $this->repoController->setSnapshotName($this->params['snapshot-name']);
++        }
+ 
+         /**
+          *  Sync packages
+@@ -105,10 +111,16 @@
+     private function local()
+     {
+         /**
+-         *  Set today date and time as target date and time
++         *  Set today date and time as target date and time.
++         *  When a snapshot-name was supplied by the user, keep it as-is;
++         *  otherwise default to today's date (identical to the historical layout).
+          */
+         $this->repoController->setDate(date('Y-m-d'));
+         $this->repoController->setTime(date('H:i'));
++        if (!empty($this->params['snapshot-name'])) {
++            \Controllers\Repo\Snapshot\Snapshot::validateName($this->params['snapshot-name']);
++            $this->repoController->setSnapshotName($this->params['snapshot-name']);
++        }
+ 
+         $this->taskLogStepController->new('create-repo', 'CREATING REPOSITORY');
+         $this->taskLogSubStepController->new('create-dirs', 'CREATING DIRECTORIES');
+@@ -128,13 +140,15 @@
+         }
+ 
+         /**
+-         *  Define snapshot directory path
++         *  Define snapshot directory path.
++         *  On-disk layout uses the snapshot name (Y-m-d or Y-m-d_suffix), never
++         *  the raw date, so multiple named snapshots can coexist for one day.
+          */
+         if ($this->repoController->getPackageType() == 'rpm') {
+-            $snapshotPath = REPOS_DIR . '/rpm/' . $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/' . $this->repoController->getDate();
++            $snapshotPath = REPOS_DIR . '/rpm/' . $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/' . $this->repoController->getSnapshotName();
+         }
+         if ($this->repoController->getPackageType() == 'deb') {
+-            $snapshotPath = REPOS_DIR . '/deb/' . $this->repoController->getName() . '/' . $this->repoController->getDist() . '/' . $this->repoController->getSection() . '/' . $this->repoController->getDate();
++            $snapshotPath = REPOS_DIR . '/deb/' . $this->repoController->getName() . '/' . $this->repoController->getDist() . '/' . $this->repoController->getSection() . '/' . $this->repoController->getSnapshotName();
+         }
+ 
+         /**
+@@ -177,9 +191,9 @@
+                 }
+ 
+                 /**
+-                 *  Create symlink
++                 *  Create symlink pointing at the snapshot directory (full name).
+                  */
+-                if (!symlink($this->repoController->getDate(), $link)) {
++                if (!symlink($this->repoController->getSnapshotName(), $link)) {
+                     throw new Exception('Could not point environment to the repository');
+                 }
+ 
+@@ -243,9 +257,9 @@
+         unset($exists, $repoId);
+ 
+         /**
+-         *  Add snapshot to database
++         *  Add snapshot to database (persist full snapshot name for on-disk layout)
+          */
+-        $this->repoSnapshotController->add($this->repoController->getDate(), $this->repoController->getTime(), 'false', $this->repoController->getArch(), $this->repoController->getAdvancedParams(), $this->repoController->getType(), 'active', $this->repoController->getRepoId());
++        $this->repoSnapshotController->add($this->repoController->getDate(), $this->repoController->getTime(), 'false', $this->repoController->getArch(), $this->repoController->getAdvancedParams(), $this->repoController->getType(), 'active', $this->repoController->getRepoId(), $this->repoController->getSnapshotName());
+ 
+         /**
+          *  Retrieve snapshot Id from the last insert row
+--- a/www/controllers/Repo/Task/Delete.php
++++ b/www/controllers/Repo/Task/Delete.php
+@@ -45,13 +45,13 @@
+             throw new Exception('<span class="label-black">' . $this->repoController->getDateFormatted() . '</span> repository snapshot does not exist anymore');
+         }
+ 
+-        // Define snapshot directory
++        // Define snapshot directory (uses full snapshot name for named snapshots)
+         if ($this->repoController->getPackageType() == 'rpm') {
+-            $snapshotPath = REPOS_DIR . '/rpm/' . $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/' . $this->repoController->getDate();
++            $snapshotPath = REPOS_DIR . '/rpm/' . $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/' . $this->repoController->getSnapshotName();
+         }
+ 
+         if ($this->repoController->getPackageType() == 'deb') {
+-            $snapshotPath = REPOS_DIR . '/deb/' . $this->repoController->getName() . '/' . $this->repoController->getDist() . '/' . $this->repoController->getSection() . '/' . $this->repoController->getDate();
++            $snapshotPath = REPOS_DIR . '/deb/' . $this->repoController->getName() . '/' . $this->repoController->getDist() . '/' . $this->repoController->getSection() . '/' . $this->repoController->getSnapshotName();
+         }
+ 
+         // Delete snapshot directory
+@@ -87,9 +87,11 @@
+                     $link = REPOS_DIR . '/deb/' . $repoController->getName() . '/' . $repoController->getDist() . '/' . $repoController->getSection() . '/' . $repoController->getEnv();
+                 }
+ 
+-                // If a symbolic link of this environment pointed to the deleted snapshot then delete the symbolic link
++                // If a symbolic link of this environment pointed to the deleted snapshot then delete the symbolic link.
++                // The symlink target holds the full snapshot name for both dated
++                // and named snapshots, so compare against getSnapshotName().
+                 if (is_link($link)) {
+-                    if (readlink($link) == $repoController->getDate()) {
++                    if (readlink($link) == $repoController->getSnapshotName()) {
+                         if (!unlink($link)) {
+                             throw new Exception('Could not remove existing symlink ' . $link);
+                         }
+--- a/www/controllers/Repo/Task/Duplicate.php
++++ b/www/controllers/Repo/Task/Duplicate.php
+@@ -53,6 +53,19 @@
+         }
+ 
+         /**
++         *  Default the target on-disk snapshot name and date to the source values.
++         *  A user-supplied snapshot-name (Y-m-d or Y-m-d_suffix) overrides only
++         *  the on-disk directory name; Date column keeps a strict Y-m-d value.
++         */
++        $this->repoController->setDate($this->sourceRepoController->getDate());
++        if (!empty($this->params['snapshot-name'])) {
++            \Controllers\Repo\Snapshot\Snapshot::validateName($this->params['snapshot-name']);
++            $this->repoController->setSnapshotName($this->params['snapshot-name']);
++        } else {
++            $this->repoController->setSnapshotName($this->sourceRepoController->getSnapshotName());
++        }
++
++        /**
+          *  Check if a repo with the same name already exists
+          */
+         if ($this->repoController->getPackageType() == 'rpm') {
+@@ -67,25 +80,25 @@
+         }
+ 
+         /**
+-         *  Define source snapshot path
++         *  Define source snapshot path (uses stored snapshot name, dated or named)
+          */
+         if ($this->sourceRepoController->getPackageType() == 'rpm') {
+-            $sourceSnapshotPath = REPOS_DIR . '/rpm/' . $this->sourceRepoController->getName() . '/' . $this->sourceRepoController->getReleasever() . '/' . $this->sourceRepoController->getDate();
++            $sourceSnapshotPath = REPOS_DIR . '/rpm/' . $this->sourceRepoController->getName() . '/' . $this->sourceRepoController->getReleasever() . '/' . $this->sourceRepoController->getSnapshotName();
+         }
+         if ($this->sourceRepoController->getPackageType() == 'deb') {
+-            $sourceSnapshotPath = REPOS_DIR . '/deb/' . $this->sourceRepoController->getName() . '/' . $this->sourceRepoController->getDist() . '/' . $this->sourceRepoController->getSection() . '/' . $this->sourceRepoController->getDate();
++            $sourceSnapshotPath = REPOS_DIR . '/deb/' . $this->sourceRepoController->getName() . '/' . $this->sourceRepoController->getDist() . '/' . $this->sourceRepoController->getSection() . '/' . $this->sourceRepoController->getSnapshotName();
+         }
+ 
+         /**
+-         *  Define target snapshot path
++         *  Define target snapshot path (uses target snapshot name)
+          */
+         if ($this->repoController->getPackageType() == 'rpm') {
+             $parentDir = REPOS_DIR . '/rpm/' . $this->repoController->getName() . '/' . $this->repoController->getReleasever();
+-            $targetSnapshotPath = REPOS_DIR . '/rpm/' . $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/'. $this->repoController->getDate();
++            $targetSnapshotPath = REPOS_DIR . '/rpm/' . $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/'. $this->repoController->getSnapshotName();
+         }
+         if ($this->repoController->getPackageType() == 'deb') {
+             $parentDir = REPOS_DIR . '/deb/' . $this->repoController->getName() . '/' . $this->repoController->getDist() . '/' . $this->repoController->getSection();
+-            $targetSnapshotPath = REPOS_DIR . '/deb/' . $this->repoController->getName() . '/' . $this->repoController->getDist() . '/' . $this->repoController->getSection() . '/' . $this->repoController->getDate();
++            $targetSnapshotPath = REPOS_DIR . '/deb/' . $this->repoController->getName() . '/' . $this->repoController->getDist() . '/' . $this->repoController->getSection() . '/' . $this->repoController->getSnapshotName();
+         }
+ 
+         /**
+@@ -246,9 +259,9 @@
+                     }
+ 
+                     /**
+-                     *  Create symlink
++                     *  Create symlink pointing at the target snapshot directory
+                      */
+-                    if (!symlink($this->repoController->getDate(), $link)) {
++                    if (!symlink($this->repoController->getSnapshotName(), $link)) {
+                         throw new Exception('Could not point environment to the repository');
+                     }
+ 
+@@ -273,9 +286,9 @@
+             }
+ 
+             /**
+-             *  Add the new repo snapshot in database
++             *  Add the new repo snapshot in database (persist full snapshot name)
+              */
+-            $this->repoSnapshotController->add($this->repoController->getDate(), $this->repoController->getTime(), $this->repoController->getSigned(), $this->repoController->getArch(), $this->repoController->getAdvancedParams(), $this->repoController->getType(), $this->repoController->getStatus(), $targetRepoId);
++            $this->repoSnapshotController->add($this->repoController->getDate(), $this->repoController->getTime(), $this->repoController->getSigned(), $this->repoController->getArch(), $this->repoController->getAdvancedParams(), $this->repoController->getType(), $this->repoController->getStatus(), $targetRepoId, $this->repoController->getSnapshotName());
+ 
+             /**
+              *  Retrieve the Id of the new repo snapshot in database
+--- a/www/controllers/Repo/Task/Env.php
++++ b/www/controllers/Repo/Task/Env.php
+@@ -37,11 +37,12 @@
+             /**
+              *  Define snapshot directory path
+              */
++            // Snapshot directory name is the full snapshot name (dated or named)
+             if ($this->repoController->getPackageType() == 'rpm') {
+-                $snapshotPath = REPOS_DIR . '/rpm/' . $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/' . $this->repoController->getDate();
++                $snapshotPath = REPOS_DIR . '/rpm/' . $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/' . $this->repoController->getSnapshotName();
+             }
+             if ($this->repoController->getPackageType() == 'deb') {
+-                $snapshotPath = REPOS_DIR . '/deb/' . $this->repoController->getName() . '/' . $this->repoController->getDist() . '/' . $this->repoController->getSection() . '/' . $this->repoController->getDate();
++                $snapshotPath = REPOS_DIR . '/deb/' . $this->repoController->getName() . '/' . $this->repoController->getDist() . '/' . $this->repoController->getSection() . '/' . $this->repoController->getSnapshotName();
+             }
+ 
+             $this->taskLogStepController->new('point-env-' . $env, 'POINT ENVIRONMENT ' . Label::envtag($env));
+@@ -123,7 +124,7 @@
+                 /**
+                  *  Create symbolic link
+                  */
+-                if (!symlink($this->repoController->getDate(), REPOS_DIR . '/rpm/' . $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/' . $env)) {
++                if (!symlink($this->repoController->getSnapshotName(), REPOS_DIR . '/rpm/' . $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/' . $env)) {
+                     throw new Exception('Could not create symbolic link: ' . REPOS_DIR . '/rpm/' . $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/' . $env);
+                 }
+             }
+@@ -160,7 +161,7 @@
+                 /**
+                  *  Create symbolic link
+                  */
+-                if (!symlink($this->repoController->getDate(), REPOS_DIR . '/deb/' . $this->repoController->getName() . '/' . $this->repoController->getDist() . '/' . $this->repoController->getSection() . '/' . $env)) {
++                if (!symlink($this->repoController->getSnapshotName(), REPOS_DIR . '/deb/' . $this->repoController->getName() . '/' . $this->repoController->getDist() . '/' . $this->repoController->getSection() . '/' . $env)) {
+                     throw new Exception('Could not create symbolic link: ' . REPOS_DIR . '/deb/' . $this->repoController->getName() . '/' . $this->repoController->getDist() . '/' . $this->repoController->getSection() . '/' . $env);
+                 }
+             }
+--- a/www/controllers/Repo/Task/Finalize.php
++++ b/www/controllers/Repo/Task/Finalize.php
+@@ -14,12 +14,14 @@
+     {
+         $this->taskLogStepController->new('finalizing', 'FINALIZING');
+ 
+-        // Define snapshot path
++        // Define snapshot path.
++        // Directory name is the snapshot name (Y-m-d or Y-m-d_suffix), never
++        // the raw date, so multiple named snapshots can coexist for one day.
+         if ($this->repoController->getPackageType() == 'rpm') {
+-            $snapshotPath = REPOS_DIR . '/rpm/' . $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/' . $this->repoController->getDate();
++            $snapshotPath = REPOS_DIR . '/rpm/' . $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/' . $this->repoController->getSnapshotName();
+         }
+         if ($this->repoController->getPackageType() == 'deb') {
+-            $snapshotPath = REPOS_DIR . '/deb/' . $this->repoController->getName() . '/' . $this->repoController->getDist() . '/' . $this->repoController->getSection() . '/' . $this->repoController->getDate();
++            $snapshotPath = REPOS_DIR . '/deb/' . $this->repoController->getName() . '/' . $this->repoController->getDist() . '/' . $this->repoController->getSection() . '/' . $this->repoController->getSnapshotName();
+         }
+ 
+         $this->taskLogSubStepController->new('updating-database', 'UPDATING DATABASE');
+@@ -57,8 +59,8 @@
+                 }
+             }
+ 
+-            // Add snapshot in database
+-            $this->repoSnapshotController->add($this->repoController->getDate(), $this->repoController->getTime(), $this->repoController->getGpgSign(), $this->repoController->getArch(), $this->repoController->getAdvancedParams(), $this->repoController->getType(), 'active', $this->repoController->getRepoId());
++            // Add snapshot in database (persist full snapshot name for on-disk layout)
++            $this->repoSnapshotController->add($this->repoController->getDate(), $this->repoController->getTime(), $this->repoController->getGpgSign(), $this->repoController->getArch(), $this->repoController->getAdvancedParams(), $this->repoController->getType(), 'active', $this->repoController->getRepoId(), $this->repoController->getSnapshotName());
+ 
+             // Retrieve the last insert row ID
+             $this->repoController->setSnapId($this->repoSnapshotController->getLastInsertRowID());
+@@ -73,10 +75,11 @@
+ 
+         if ($this->action == 'update') {
+             /**
+-             *  Case where the new snapshot date is the same as the old one,
+-             *  We only update the repository information in the database and nothing else.
++             *  Case where the new snapshot lands on the same on-disk directory
++             *  as the source snapshot (identical Y-m-d or identical Y-m-d_suffix),
++             *  we only update the repository information in the database and nothing else.
+              */
+-            if ($this->sourceRepoController->getDate() == $this->repoController->getDate()) {
++            if ($this->sourceRepoController->getSnapshotName() == $this->repoController->getSnapshotName()) {
+                 // Update GPG signature state
+                 $this->repoSnapshotController->updateGpgSignature($this->repoController->getSnapId(), $this->repoController->getGpgSign());
+ 
+@@ -94,8 +97,8 @@
+ 
+             // Otherwise we add a new snapshot in the database with today's date
+             } else {
+-                // Add snapshot in database
+-                $this->repoSnapshotController->add($this->repoController->getDate(), $this->repoController->getTime(), $this->repoController->getGpgSign(), $this->repoController->getArch(), $this->repoController->getAdvancedParams(), $this->repoController->getType(), 'active', $this->repoController->getRepoId());
++                // Add snapshot in database (persist full snapshot name for on-disk layout)
++                $this->repoSnapshotController->add($this->repoController->getDate(), $this->repoController->getTime(), $this->repoController->getGpgSign(), $this->repoController->getArch(), $this->repoController->getAdvancedParams(), $this->repoController->getType(), 'active', $this->repoController->getRepoId(), $this->repoController->getSnapshotName());
+ 
+                 // Retrieve the last insert row Id, so we can set snapId = this Id
+                 $this->repoController->setSnapId($this->repoSnapshotController->getLastInsertRowID());
+@@ -166,12 +169,12 @@
+         $this->taskLogSubStepController->new('applying-permissions', 'APPLYING PERMISSIONS');
+ 
+         if ($this->repoController->getPackageType() == 'rpm') {
+-            File::recursiveChmod(REPOS_DIR . '/rpm/' . $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/' . $this->repoController->getDate(), 'dir', 770);
+-            File::recursiveChmod(REPOS_DIR . '/rpm/' . $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/' . $this->repoController->getDate(), 'file', 660);
++            File::recursiveChmod(REPOS_DIR . '/rpm/' . $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/' . $this->repoController->getSnapshotName(), 'dir', 770);
++            File::recursiveChmod(REPOS_DIR . '/rpm/' . $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/' . $this->repoController->getSnapshotName(), 'file', 660);
+         }
+         if ($this->repoController->getPackageType() == 'deb') {
+-            File::recursiveChmod(REPOS_DIR . '/deb/' . $this->repoController->getName() . '/' . $this->repoController->getDist() . '/' . $this->repoController->getSection() . '/' . $this->repoController->getDate(), 'dir', 770);
+-            File::recursiveChmod(REPOS_DIR . '/deb/' . $this->repoController->getName() . '/' . $this->repoController->getDist() . '/' . $this->repoController->getSection() . '/' . $this->repoController->getDate(), 'file', 660);
++            File::recursiveChmod(REPOS_DIR . '/deb/' . $this->repoController->getName() . '/' . $this->repoController->getDist() . '/' . $this->repoController->getSection() . '/' . $this->repoController->getSnapshotName(), 'dir', 770);
++            File::recursiveChmod(REPOS_DIR . '/deb/' . $this->repoController->getName() . '/' . $this->repoController->getDist() . '/' . $this->repoController->getSection() . '/' . $this->repoController->getSnapshotName(), 'file', 660);
+         }
+ 
+         $this->taskLogSubStepController->completed();
+--- a/www/controllers/Repo/Task/Update.php
++++ b/www/controllers/Repo/Task/Update.php
+@@ -4,6 +4,7 @@
+ 
+ use Controllers\Filesystem\Directory;
+ use Controllers\Filesystem\File;
++use Controllers\Utils\Generate\Html\Label;
+ use Exception;
+ 
+ class Update extends \Controllers\Task\Execution
+@@ -43,10 +44,16 @@
+     public function execute()
+     {
+         /**
+-         *  Define default date and time
++         *  Define default date and time.
++         *  When a snapshot-name was supplied by the user, keep it as-is; otherwise
++         *  fall back to today's date so behaviour matches the historical layout.
+          */
+         $this->repoController->setDate(date('Y-m-d'));
+         $this->repoController->setTime(date('H:i'));
++        if (!empty($this->params['snapshot-name'])) {
++            \Controllers\Repo\Snapshot\Snapshot::validateName($this->params['snapshot-name']);
++            $this->repoController->setSnapshotName($this->params['snapshot-name']);
++        }
+ 
+         /**
+          *  Sync packages (if mirror repo)
+@@ -99,16 +106,18 @@
+         }
+ 
+         /**
+-         *  We cannot update a snapshot in the same day
+-         */
+-        if ($this->repoController->getPackageType() == 'rpm') {
+-            if ($this->rpmRepoController->existsSnapDate($this->repoController->getName(), $this->repoController->getReleasever(), $this->repoController->getDate())) {
+-                throw new Exception('A snapshot already exists on the <span class="label-black">' . $this->repoController->getDateFormatted() . '</span>');
+-            }
+-        }
+-        if ($this->repoController->getPackageType() == 'deb') {
+-            if ($this->debRepoController->existsSnapDate($this->repoController->getName(), $this->repoController->getDist(), $this->repoController->getSection(), $this->repoController->getDate())) {
+-                throw new Exception('A snapshot already exists on the <span class="label-black">' . $this->repoController->getDateFormatted() . '</span>');
++         *  We cannot create two snapshots with the same on-disk name.
++         *  Historically this used to check the date only; with named snapshots
++         *  we check the full snapshot name so that "2026-07-17_foo" and
++         *  "2026-07-17_bar" can peacefully coexist for the same day.
++         *  getAllById() (called from the parent constructor to retrieve the
++         *  source snapshot) already seeded getSnapshotName() with the source
++         *  snapshot's own name, so an in-place update (no explicit
++         *  snapshot-name override) must be allowed to collide with itself.
++         */
++        if ($this->repoSnapshotController->getNameById($this->repoController->getSnapId()) != $this->repoController->getSnapshotName()) {
++            if ($this->repoSnapshotController->existsName($this->repoController->getRepoId(), $this->repoController->getSnapshotName())) {
++                throw new Exception('A snapshot named ' . Label::black($this->repoController->getSnapshotName()) . ' already exists for this repository');
+             }
+         }
+ 
+@@ -120,13 +129,15 @@
+         }
+ 
+         /**
+-         *  Define previous snapshot directory path
++         *  Define previous snapshot directory path.
++         *  On-disk name comes from repos_snap.Name (falls back to Date for
++         *  legacy rows), so both dated and named snapshots resolve correctly.
+          */
+         if ($this->sourceRepoController->getPackageType() == 'rpm') {
+-            $previousSnapshotDir = REPOS_DIR . '/rpm/' . $this->sourceRepoController->getName() . '/' . $this->sourceRepoController->getReleasever() . '/' . $this->sourceRepoController->getDate();
++            $previousSnapshotDir = REPOS_DIR . '/rpm/' . $this->sourceRepoController->getName() . '/' . $this->sourceRepoController->getReleasever() . '/' . $this->sourceRepoController->getSnapshotName();
+         }
+         if ($this->sourceRepoController->getPackageType() == 'deb') {
+-            $previousSnapshotDir = REPOS_DIR . '/deb/' . $this->sourceRepoController->getName() . '/' . $this->sourceRepoController->getDist() . '/' . $this->sourceRepoController->getSection() . '/' . $this->sourceRepoController->getDate();
++            $previousSnapshotDir = REPOS_DIR . '/deb/' . $this->sourceRepoController->getName() . '/' . $this->sourceRepoController->getDist() . '/' . $this->sourceRepoController->getSection() . '/' . $this->sourceRepoController->getSnapshotName();
+         }
+ 
+         /**
+--- a/www/controllers/Repo/Metadata/Create.php
++++ b/www/controllers/Repo/Metadata/Create.php
+@@ -23,11 +23,11 @@
+         // Define final snapshot path and parent directory
+         if ($this->repoController->getPackageType() == 'rpm') {
+             $parentDir = REPOS_DIR . '/rpm/' . $this->repoController->getName() . '/' . $this->repoController->getReleasever();
+-            $snapshotPath = $parentDir . '/' . $this->repoController->getDate();
++            $snapshotPath = $parentDir . '/' . $this->repoController->getSnapshotName();
+         }
+         if ($this->repoController->getPackageType() == 'deb') {
+             $parentDir = REPOS_DIR . '/deb/' . $this->repoController->getName() . '/' . $this->repoController->getDist() . '/' . $this->repoController->getSection();
+-            $snapshotPath = $parentDir . '/' . $this->repoController->getDate();
++            $snapshotPath = $parentDir . '/' . $this->repoController->getSnapshotName();
+         }
+ 
+         // If action is 'rebuild' or 'duplicate', set working dir to the existing snapshot path
+@@ -100,8 +100,8 @@
+                         }
+                     }
+ 
+-                    // Create symlink
+-                    if (!symlink($this->repoController->getDate(), $link)) {
++                    // Create symlink pointing at snapshot dir name
++                    if (!symlink($this->repoController->getSnapshotName(), $link)) {
+                         throw new Exception('Could not point environment to the repository');
+                     }
+ 
+--- a/www/controllers/Repo/Snapshot/Package.php
++++ b/www/controllers/Repo/Snapshot/Package.php
+@@ -38,12 +38,12 @@
+ 
+         // Define snapshot path
+         if ($this->repoController->getPackageType() == 'rpm') {
+-            $this->snapshotPath = REPOS_DIR .'/rpm/'. $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/' . $this->repoController->getDate();
+-            $this->rootUrl = WWW_REPOS_DIR_URL . '/rpm/' . $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/' . $this->repoController->getDate();
++            $this->snapshotPath = REPOS_DIR .'/rpm/'. $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/' . $this->repoController->getSnapshotName();
++            $this->rootUrl = WWW_REPOS_DIR_URL . '/rpm/' . $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/' . $this->repoController->getSnapshotName();
+         }
+         if ($this->repoController->getPackageType() == 'deb') {
+-            $this->snapshotPath = REPOS_DIR .'/deb/'. $this->repoController->getName() . '/'. $this->repoController->getDist() . '/' . $this->repoController->getSection() . '/' . $this->repoController->getDate();
+-            $this->rootUrl = WWW_REPOS_DIR_URL . '/deb/' . $this->repoController->getName() . '/' . $this->repoController->getDist() . '/' . $this->repoController->getSection() . '/' . $this->repoController->getDate();
++            $this->snapshotPath = REPOS_DIR .'/deb/'. $this->repoController->getName() . '/'. $this->repoController->getDist() . '/' . $this->repoController->getSection() . '/' . $this->repoController->getSnapshotName();
++            $this->rootUrl = WWW_REPOS_DIR_URL . '/deb/' . $this->repoController->getName() . '/' . $this->repoController->getDist() . '/' . $this->repoController->getSection() . '/' . $this->repoController->getSnapshotName();
+         }
+ 
+         // Check that the snapshot path exists
+--- a/www/controllers/Repo/Package/Sign.php
++++ b/www/controllers/Repo/Package/Sign.php
+@@ -32,7 +32,7 @@
+ 
+         // If action is 'rebuild', set working dir to the existing snapshot path
+         if ($this->action == 'rebuild') {
+-            $workingDir = REPOS_DIR . '/rpm/' . $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/' . $this->repoController->getDate();
++            $workingDir = REPOS_DIR . '/rpm/' . $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/' . $this->repoController->getSnapshotName();
+         }
+ 
+         /**
+--- a/www/controllers/Layout/Container/vars/browse/list.vars.inc.php
++++ b/www/controllers/Layout/Container/vars/browse/list.vars.inc.php
+@@ -28,11 +28,11 @@
+  *  Define snapshot path
+  */
+ if ($myrepo->getPackageType() == 'rpm') {
+-    $snapshotPath = REPOS_DIR . '/rpm/' . $myrepo->getName() . '/' . $myrepo->getReleasever() . '/' . $myrepo->getDate();
++    $snapshotPath = REPOS_DIR . '/rpm/' . $myrepo->getName() . '/' . $myrepo->getReleasever() . '/' . $myrepo->getSnapshotName();
+ }
+ 
+ if ($myrepo->getPackageType() == 'deb') {
+-    $snapshotPath = REPOS_DIR . '/deb/' . $myrepo->getName() . '/' . $myrepo->getDist() . '/' . $myrepo->getSection() . '/' . $myrepo->getDate();
++    $snapshotPath = REPOS_DIR . '/deb/' . $myrepo->getName() . '/' . $myrepo->getDist() . '/' . $myrepo->getSection() . '/' . $myrepo->getSnapshotName();
+ }
+ 
+ /**
+--- a/www/controllers/Layout/Container/vars/browse/actions.vars.inc.php
++++ b/www/controllers/Layout/Container/vars/browse/actions.vars.inc.php
+@@ -27,11 +27,11 @@
+  *  Define snapshot path
+  */
+ if ($repoController->getPackageType() == 'rpm') {
+-    $snapshotPath = REPOS_DIR . '/rpm/' . $repoController->getName() . '/' . $repoController->getReleasever() . '/' . $repoController->getDate();
++    $snapshotPath = REPOS_DIR . '/rpm/' . $repoController->getName() . '/' . $repoController->getReleasever() . '/' . $repoController->getSnapshotName();
+ }
+ 
+ if ($repoController->getPackageType() == 'deb') {
+-    $snapshotPath = REPOS_DIR . '/deb/' . $repoController->getName() . '/' . $repoController->getDist() . '/' . $repoController->getSection() . '/' . $repoController->getDate();
++    $snapshotPath = REPOS_DIR . '/deb/' . $repoController->getName() . '/' . $repoController->getDist() . '/' . $repoController->getSection() . '/' . $repoController->getSnapshotName();
+ }
+ 
+ /**

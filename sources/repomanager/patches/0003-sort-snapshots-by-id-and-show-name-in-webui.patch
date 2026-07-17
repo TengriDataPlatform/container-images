@@ -1,0 +1,357 @@
+--- a/www/controllers/Task/Form/Create.php
++++ b/www/controllers/Task/Form/Create.php
+@@ -48,6 +48,12 @@
+         // Check description
+         Param\Description::check($formParams['description']);
+ 
++        // Check snapshot name (optional, arbitrary URL-safe label used as
++        // the on-disk directory name; the creation date is tracked separately)
++        if (!empty($formParams['snapshot-name'])) {
++            \Controllers\Repo\Snapshot\Snapshot::validateName($formParams['snapshot-name']);
++        }
++
+         // Check group
+         if (!empty($formParams['group'])) {
+             Param\Group::check($formParams['group']);
+--- a/www/controllers/Task/Form/Duplicate.php
++++ b/www/controllers/Task/Form/Duplicate.php
+@@ -34,6 +34,12 @@
+             Param\Description::check($formParams['description']);
+         }
+ 
++        // Check snapshot name (optional, arbitrary URL-safe label used as
++        // the on-disk directory name; the creation date is tracked separately)
++        if (!empty($formParams['snapshot-name'])) {
++            \Controllers\Repo\Snapshot\Snapshot::validateName($formParams['snapshot-name']);
++        }
++
+         // Check group
+         if (!empty($formParams['group'])) {
+             Param\Group::check($formParams['group']);
+--- a/www/controllers/Task/Form/Update.php
++++ b/www/controllers/Task/Form/Update.php
+@@ -23,6 +23,12 @@
+             Param\Environment::check($formParams['env']);
+         }
+ 
++        // Check snapshot name (optional, arbitrary URL-safe label used as
++        // the on-disk directory name; the creation date is tracked separately)
++        if (!empty($formParams['snapshot-name'])) {
++            \Controllers\Repo\Snapshot\Snapshot::validateName($formParams['snapshot-name']);
++        }
++
+         // Check architecture
+         Param\Arch::check($formParams['arch']);
+ 
+--- a/www/models/Repo/Listing.php
++++ b/www/models/Repo/Listing.php
+@@ -36,6 +36,7 @@
+             repos_snap.Signed,
+             repos_snap.Arch,
+             repos_snap.Type,
++            repos_snap.Name AS Snap_name,
+             repos_env.Description
+             FROM repos 
+             LEFT JOIN repos_snap
+@@ -43,7 +44,7 @@
+             LEFT JOIN repos_env 
+                 ON repos_snap.Id = repos_env.Id_snap
+             WHERE repos_snap.Status = 'active'
+-            ORDER BY repos.Name ASC, repos.Releasever ASC, repos.Dist ASC, repos.Section ASC, repos_snap.Date DESC");
++            ORDER BY repos.Name ASC, repos.Releasever ASC, repos.Dist ASC, repos.Section ASC, repos_snap.Id DESC");
+         } catch (Exception $e) {
+             DbLog::error($e);
+         }
+@@ -83,14 +84,15 @@
+                 repos_snap.Type,
+                 repos_snap.Reconstruct,
+                 repos_snap.Status,
++                repos_snap.Name AS Snap_name,
+                 repos_env.Description
+-                FROM repos
+-                LEFT JOIN repos_snap
++                FROM repos 
++                INNER JOIN repos_snap
+                     ON repos.Id = repos_snap.Id_repo
+-                LEFT JOIN repos_env 
++                LEFT JOIN repos_env
+                     ON repos_env.Id_snap = repos_snap.Id
+                 WHERE repos_snap.Status = 'active' AND repos.Id NOT IN (SELECT Id_repo FROM group_members)
+-                ORDER BY repos.Name ASC, repos.Releasever ASC, repos.Dist ASC, repos.Section ASC, repos_snap.Date DESC, repos_env.Env ASC");
++                ORDER BY repos.Name ASC, repos.Releasever ASC, repos.Dist ASC, repos.Section ASC, repos_snap.Id DESC, repos_env.Env ASC");
+             } else {
+                 $stmt = $this->db->prepare("SELECT DISTINCT
+                 repos.Id AS repoId,
+@@ -110,6 +112,7 @@
+                 repos_snap.Type,
+                 repos_snap.Reconstruct,
+                 repos_snap.Status,
++                repos_snap.Name AS Snap_name,
+                 repos_env.Description
+                 FROM repos
+                 LEFT JOIN repos_snap
+@@ -122,7 +125,7 @@
+                     ON groups.Id = group_members.Id_group
+                 WHERE groups.Name = :groupname
+                 AND repos_snap.Status = 'active'
+-                ORDER BY repos.Name ASC, repos.Releasever ASC, repos.Dist ASC, repos.Section ASC, repos_snap.Date DESC, repos_env.Env ASC");
++                ORDER BY repos.Name ASC, repos.Releasever ASC, repos.Dist ASC, repos.Section ASC, repos_snap.Id DESC, repos_env.Env ASC");
+                 $stmt->bindValue(':groupname', $groupName);
+                 $result = $stmt->execute();
+             }
+@@ -202,7 +205,7 @@
+             FROM repos_snap
+             WHERE repos_snap.Id_repo = :repoId
+             AND repos_snap.Status = 'active'
+-            ORDER BY repos_snap.Date DESC");
++            ORDER BY repos_snap.Id DESC");
+             $stmt->bindValue(':repoId', $repoId);
+             $result = $stmt->execute();
+         } catch (Exception $e) {
+--- a/www/models/Repo/Repo.php
++++ b/www/models/Repo/Repo.php
+@@ -199,7 +199,7 @@
+         $snapId = null;
+ 
+         try {
+-            $stmt = $this->db->prepare("SELECT Id FROM repos_snap WHERE Id_repo = :repoId AND Status = 'active' ORDER BY Date DESC LIMIT 1");
++            $stmt = $this->db->prepare("SELECT Id FROM repos_snap WHERE Id_repo = :repoId AND Status = 'active' ORDER BY Id DESC LIMIT 1");
+             $stmt->bindValue(':repoId', $repoId);
+             $result = $stmt->execute();
+         } catch (Exception $e) {
+--- a/www/models/Repo/Snapshot/Snapshot.php
++++ b/www/models/Repo/Snapshot/Snapshot.php
+@@ -66,7 +66,7 @@
+         $data = [];
+ 
+         try {
+-            $result = $this->db->query("SELECT * FROM repos_snap WHERE Status = 'active' ORDER BY Date DESC");
++            $result = $this->db->query("SELECT * FROM repos_snap WHERE Status = 'active' ORDER BY Id DESC");
+         } catch (Exception $e) {
+             DbLog::error($e);
+         }
+@@ -120,7 +120,7 @@
+             WHERE repos_snap.Id_repo = :repoId
+             AND repos_env.Id_snap IS NULL
+             AND repos_snap.Status = 'active'
+-            ORDER BY Date DESC LIMIT -1 OFFSET :retention");
++            ORDER BY repos_snap.Id DESC LIMIT -1 OFFSET :retention");
+             $stmt->bindValue(':repoId', $repoId);
+             $stmt->bindValue(':retention', $retention);
+             $result = $stmt->execute();
+--- a/www/views/includes/containers/browse/list.inc.php
++++ b/www/views/includes/containers/browse/list.inc.php
+@@ -20,7 +20,7 @@
+ 
+         <div>
+             <h6 class="margin-top-0">SNAPSHOT</h6>
+-            <p><span class="label-black"><?= $myrepo->getDateFormatted() ?></span></p>
++            <p><span class="label-black" title="<?= $myrepo->getDate() . ' ' . $myrepo->getTime() ?>"><?= $myrepo->getSnapshotName() ?></span></p>
+         </div>
+ 
+         <div>
+--- a/www/views/includes/forms/edit.inc.php
++++ b/www/views/includes/forms/edit.inc.php
+@@ -67,6 +67,6 @@
+ endif ?>
+ 
+ <h6>SNAPSHOT</h6>
+-<span class="label-black"><?= $repoController->getDateFormatted() ?></span>
++<span class="label-black" title="<?= $repoController->getDate() . ' ' . $repoController->getTime() ?>"><?= $repoController->getSnapshotName() ?></span>
+ 
+ <p class="note margin-top-5">Nothing editable for now!</p>
+--- a/www/views/includes/forms/tasks/delete.inc.php
++++ b/www/views/includes/forms/tasks/delete.inc.php
+@@ -1,11 +1,12 @@
+ <h6>DELETE</h6>
+ <p class="note">The repository snapshot to delete.</p>
+ <?php
++$snapTooltip = $repoController->getDate() . ' ' . $repoController->getTime();
+ if ($repoController->getPackageType() == 'rpm') {
+-    echo '<span class="label-white">' . $repoController->getName() . ' ❯ ' . $repoController->getReleasever() . '</span>⸺<span class="label-black">' . $repoController->getDateFormatted() . '</span>';
++    echo '<span class="label-white">' . $repoController->getName() . ' ❯ ' . $repoController->getReleasever() . '</span>⸺<span class="label-black" title="' . $snapTooltip . '">' . $repoController->getSnapshotName() . '</span>';
+ }
+ if ($repoController->getPackageType() == 'deb') {
+-    echo '<p><span class="label-white">' . $repoController->getName() . ' ❯ ' . $repoController->getDist() . ' ❯ ' . $repoController->getSection() . '</span>⸺<span class="label-black">' . $repoController->getDateFormatted() . '</span></p>';
++    echo '<p><span class="label-white">' . $repoController->getName() . ' ❯ ' . $repoController->getDist() . ' ❯ ' . $repoController->getSection() . '</span>⸺<span class="label-black" title="' . $snapTooltip . '">' . $repoController->getSnapshotName() . '</span></p>';
+ }
+ 
+ if ($scheduledTasksCount > 0) : ?>
+--- a/www/views/includes/forms/tasks/duplicate.inc.php
++++ b/www/views/includes/forms/tasks/duplicate.inc.php
+@@ -12,13 +12,17 @@
+         } ?>
+     </p>
+ 
+-    <p>⸺<span class="label-black"><?= $repoController->getDateFormatted() ?></span></p>
++    <p>⸺<span class="label-black" title="<?= $repoController->getDate() . ' ' . $repoController->getTime() ?>"><?= $repoController->getSnapshotName() ?></span></p>
+ </div>
+   
+ <h6 class="required">NEW REPOSITORY NAME</h6>
+ <p class="note">The name of the new repository.</p>
+ <input type="text" class="task-param" param-name="name" required />
+ 
++<h6>SNAPSHOT NAME</h6>
++<p class="note">Optional. Arbitrary URL-safe label used as the on-disk directory name for the duplicated snapshot. Leave empty to use today's date. Allowed characters: <code>[A-Za-z0-9][A-Za-z0-9._-]*</code>.</p>
++<input type="text" class="task-param" param-name="snapshot-name" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" placeholder="e.g. hotfix" />
++
+ <h6>POINT AN ENVIRONMENT</h6>
+ <p class="note">Select one or multiple environments to point to the new repository snapshot.</p>
+ <select id="duplicate-repo-target-env-select-<?= $repoController->getSnapId() ?>" class="task-param" param-name="env" multiple>
+--- a/www/views/includes/forms/tasks/env.inc.php
++++ b/www/views/includes/forms/tasks/env.inc.php
+@@ -12,7 +12,7 @@
+         } ?>
+     </p>
+ 
+-    <p>⸺<span class="label-black"><?= $repoController->getDateFormatted() ?></span></p>
++    <p>⸺<span class="label-black" title="<?= $repoController->getDate() . ' ' . $repoController->getTime() ?>"><?= $repoController->getSnapshotName() ?></span></p>
+ </div>
+ 
+ <h6 class="required">ENVIRONMENT</h6>
+--- a/www/views/includes/forms/tasks/rebuild.inc.php
++++ b/www/views/includes/forms/tasks/rebuild.inc.php
+@@ -12,7 +12,7 @@
+         } ?>
+     </p>
+ 
+-    <p>⸺<span class="label-black"><?= $repoController->getDateFormatted() ?></span></p>
++    <p>⸺<span class="label-black" title="<?= $repoController->getDate() . ' ' . $repoController->getTime() ?>"><?= $repoController->getSnapshotName() ?></span></p>
+ </div>
+ 
+ <h6>SIGN WITH GPG</h6>
+--- a/www/views/includes/forms/tasks/update.inc.php
++++ b/www/views/includes/forms/tasks/update.inc.php
+@@ -42,6 +42,10 @@
+     endif; ?>
+ </select>
+ 
++<h6>SNAPSHOT NAME</h6>
++<p class="note">Optional. Arbitrary URL-safe label used as the on-disk directory name for the new snapshot. Leave empty to use today's date. Allowed characters: <code>[A-Za-z0-9][A-Za-z0-9._-]*</code>.</p>
++<input type="text" class="task-param" param-name="snapshot-name" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" placeholder="e.g. hotfix" />
++
+ <h6>POINT AN ENVIRONMENT</h6>
+ <p class="note">Select one or multiple environments to point to the new snapshot.</p>
+ <select id="update-repo-target-env-select-<?= $repoController->getSnapId() ?>" class="task-param" param-name="env" multiple>
+--- a/www/views/includes/panels/repos/new.inc.php
++++ b/www/views/includes/panels/repos/new.inc.php
+@@ -151,6 +151,10 @@
+             </div>
+         </div>
+ 
++        <h6>SNAPSHOT NAME</h6>
++        <p class="note">Optional. Arbitrary URL-safe label used as the on-disk directory name for the initial snapshot. Leave empty to use today's date. Allowed characters: <code>[A-Za-z0-9][A-Za-z0-9._-]*</code>.</p>
++        <input type="text" class="task-param" param-name="snapshot-name" package-type="all" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" placeholder="e.g. hotfix" />
++
+         <h6>POINT AN ENVIRONMENT</h6>
+         <p class="note">Point an environment to the newly created repository.</p>
+         <select id="new-repo-target-env-select" class="task-param" param-name="env" package-type="all" multiple>
+--- a/www/views/includes/repos-list.inc.php
++++ b/www/views/includes/repos-list.inc.php
+@@ -100,6 +100,12 @@
+                             $date           = $repo['Date'];
+                             $dateFormatted  = DateTime::createFromFormat('Y-m-d', $repo['Date'])->format('d-m-Y');
+                             $time           = $repo['Time'];
++                            // On-disk snapshot directory name: falls back to
++                            // the date for legacy snapshots without a Name.
++                            $snapName       = !empty($repo['Snap_name']) ? $repo['Snap_name'] : $date;
++                            // ISO date-time tooltip surfaces the creation
++                            // timestamp when the name alone is not descriptive.
++                            $snapTooltip    = $date . ' ' . $time;
+                             $type           = $repo['Type'];
+                             $signed         = $repo['Signed'];
+                             $arch           = $repo['Arch'];
+@@ -127,7 +133,7 @@
+                             }
+ 
+                             if ($packageType == 'rpm') {
+-                                $snapshotPath = REPOS_DIR . '/rpm/' . $name . '/' . $releaseVersion . '/' . $date;
++                                $snapshotPath = REPOS_DIR . '/rpm/' . $name . '/' . $releaseVersion . '/' . $snapName;
+ 
+                                 if ($name == $previousName and $snapId != $previousSnapId) {
+                                     $printEmptyLine = true;
+@@ -147,7 +153,7 @@
+                             }
+ 
+                             if ($packageType == 'deb') {
+-                                $snapshotPath = REPOS_DIR . '/deb/' . $name . '/' . $dist . '/' . $section . '/' . $date;
++                                $snapshotPath = REPOS_DIR . '/deb/' . $name . '/' . $dist . '/' . $section . '/' . $snapName;
+ 
+                                 if ($name == $previousName and $dist == $previousDist and $section == $previousSection) {
+                                     $printRepoName    = false;
+@@ -289,11 +295,11 @@
+                             <?php
+                             // Generate repo relative path
+                             if ($packageType == 'rpm') {
+-                                $repoRelativePath = 'rpm/' .$name . '/' . $releaseVersion . '/' . $date;
++                                $repoRelativePath = 'rpm/' .$name . '/' . $releaseVersion . '/' . $snapName;
+                             }
+ 
+                             if ($packageType == 'deb') {
+-                                $repoRelativePath = 'deb/' . $name . '/' . $dist . '/' . $section . '/' . $date;
++                                $repoRelativePath = 'deb/' . $name . '/' . $dist . '/' . $section . '/' . $snapName;
+                             } ?>
+ 
+                             <div class="item-snapshot">
+@@ -302,12 +308,12 @@
+                                     <div class="item-date">
+                                         <?php
+                                         if (RepoPermission::allowedAction('browse')) : ?>
+-                                            <a href="/browse/<?= $snapId ?>" title="<?= "Browse snapshot ($dateFormatted $time) content" ?>">
+-                                                <span><?= $dateFormatted ?></span>
++                                            <a href="/browse/<?= $snapId ?>" title="<?= 'Browse snapshot ' . $snapName . ' (created ' . $snapTooltip . ') content' ?>">
++                                                <span title="<?= $snapTooltip ?>"><?= $snapName ?></span>
+                                             </a>
+                                             <?php
+                                         else : ?>
+-                                            <span><?= $dateFormatted ?></span>
++                                            <span title="<?= $snapTooltip ?>"><?= $snapName ?></span>
+                                             <?php
+                                         endif ?>
+                                     </div>
+--- a/www/views/templates/tasks/delete.inc.php
++++ b/www/views/templates/tasks/delete.inc.php
+@@ -33,8 +33,8 @@
+         </div>
+ 
+         <div>
+-            <h6 class="margin-top-0">DATE</h6>
+-            <p class="label-black"><?= $repoController->getDateFormatted() ?></p>
++            <h6 class="margin-top-0">SNAPSHOT</h6>
++            <p class="label-black" title="<?= $repoController->getDate() . ' ' . $repoController->getTime() ?>"><?= $repoController->getSnapshotName() ?></p>
+         </div>
+     </div>
+ </div>
+--- a/www/views/templates/tasks/duplicate.inc.php
++++ b/www/views/templates/tasks/duplicate.inc.php
+@@ -35,7 +35,7 @@
+         <div>
+             <h6 class="margin-top-0">SNAPSHOT</h6>
+             <p>
+-                <span class="label-black"><?= $repoController->getDateFormatted() ?></span>
++                <span class="label-black" title="<?= $repoController->getDate() . ' ' . $repoController->getTime() ?>"><?= $repoController->getSnapshotName() ?></span>
+             </p>
+         </div>
+     </div>
+--- a/www/views/templates/tasks/env.inc.php
++++ b/www/views/templates/tasks/env.inc.php
+@@ -35,7 +35,7 @@
+         <div>
+             <h6 class="margin-top-0">SNAPSHOT</h6>
+             <p>
+-                <span class="label-black"><?= $repoController->getDateFormatted() ?></span>
++                <span class="label-black" title="<?= $repoController->getDate() . ' ' . $repoController->getTime() ?>"><?= $repoController->getSnapshotName() ?></span>
+             </p>
+         </div>
+     </div>
+--- a/www/views/templates/tasks/rebuild.inc.php
++++ b/www/views/templates/tasks/rebuild.inc.php
+@@ -35,7 +35,7 @@
+         <div>
+             <h6 class="margin-top-0">SNAPSHOT</h6>
+             <p>
+-                <span class="label-black"><?= $repoController->getDateFormatted() ?></span>
++                <span class="label-black" title="<?= $repoController->getDate() . ' ' . $repoController->getTime() ?>"><?= $repoController->getSnapshotName() ?></span>
+             </p>
+         </div>
+     </div>

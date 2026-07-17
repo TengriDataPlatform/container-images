@@ -1,0 +1,412 @@
+--- a/www/config/tasks/create.php
++++ b/www/config/tasks/create.php
+@@ -18,6 +18,7 @@
+         'env',
+         'group',
+         'description',
++        'snapshot-name', // Explicit snapshot directory name (Y-m-d or Y-m-d_suffix), overrides today's date
+         'advanced-params' // Advanced params include package include/exclude and metadata custom fields, it is optional
+     ],
+ 
+--- a/www/config/tasks/duplicate.php
++++ b/www/config/tasks/duplicate.php
+@@ -19,6 +19,7 @@
+         'env',
+         'group',
+         'description',
++        'snapshot-name', // Explicit snapshot directory name for the duplicated snapshot (Y-m-d or Y-m-d_suffix), overrides source date
+     ],
+ 
+     // Conditional params must be compared with form values
+--- a/www/config/tasks/update.php
++++ b/www/config/tasks/update.php
+@@ -19,6 +19,7 @@
+     // Optional params
+     'optional-params' => [
+         'env',
++        'snapshot-name', // Explicit snapshot directory name (Y-m-d or Y-m-d_suffix), overrides today's date
+         'advanced-params' // Advanced params include package include/exclude and metadata custom fields, it is optional
+     ],
+ 
+--- a/www/controllers/Repo/Repo.php
++++ b/www/controllers/Repo/Repo.php
+@@ -24,6 +24,7 @@
+     private $section;
+     private $date;
+     private $dateFormatted;
++    private $snapshotName;
+     private $time;
+     private $env;
+     private $description;
+@@ -87,6 +88,15 @@
+         $this->dateFormatted = DateTime::createFromFormat('Y-m-d', $date)->format('d-m-Y');
+     }
+ 
++    /**
++     *  Set the snapshot name (full on-disk directory name).
++     *  Accepted format: 'Y-m-d' or 'Y-m-d_<suffix>'.
++     */
++    public function setSnapshotName(string $snapshotName): void
++    {
++        $this->snapshotName = $snapshotName;
++    }
++
+     public function setTime(string $time): void
+     {
+         $this->time = $time;
+@@ -212,6 +222,20 @@
+         return DateTime::createFromFormat('Y-m-d', $this->date)->format('d-m-Y');
+     }
+ 
++    /**
++     *  Return the full snapshot name (on-disk directory name).
++     *  Falls back to the Y-m-d date when no explicit name was set, preserving
++     *  the historical layout used for snapshots without a suffix.
++     */
++    public function getSnapshotName(): string
++    {
++        if (!empty($this->snapshotName)) {
++            return $this->snapshotName;
++        }
++
++        return $this->date;
++    }
++
+     public function getTime(): string
+     {
+         return $this->time;
+@@ -322,6 +346,11 @@
+         if (!empty($data['Date'])) {
+             $this->setDate($data['Date']);
+         }
++        // Snap_name is a SELECT alias for repos_snap.Name to avoid clashing
++        // with repos.Name. Fall back to Date is handled by getSnapshotName().
++        if (!empty($data['Snap_name'])) {
++            $this->setSnapshotName($data['Snap_name']);
++        }
+         if (!empty($data['Time'])) {
+             $this->setTime($data['Time']);
+         }
+--- a/www/controllers/Repo/Snapshot/Snapshot.php
++++ b/www/controllers/Repo/Snapshot/Snapshot.php
+@@ -10,6 +10,15 @@
+ 
+ class Snapshot
+ {
++    /**
++     *  Regex accepted for the snapshot name (WebUI / CLI / API input).
++     *  The snapshot name is an arbitrary URL-safe label used as the on-disk
++     *  directory name and stored in repos_snap.Name. The creation date is
++     *  tracked independently in repos_snap.Date, so the name does not need
++     *  to embed any date component.
++     */
++    public const NAME_PATTERN = '/^[A-Za-z0-9][A-Za-z0-9._-]*$/';
++
+     private $model;
+ 
+     public function __construct()
+@@ -18,6 +27,17 @@
+     }
+ 
+     /**
++     *  Validate a user-supplied snapshot name.
++     *  Throws when the value cannot be safely used as a directory name.
++     */
++    public static function validateName(string $name): void
++    {
++        if (!preg_match(self::NAME_PATTERN, $name)) {
++            throw new Exception('Invalid snapshot name "' . $name . '": expected [A-Za-z0-9][A-Za-z0-9._-]*');
++        }
++    }
++
++    /**
+      *  Return the list of all active snapshots
+      */
+     public function get(): array
+@@ -64,9 +84,11 @@
+     }
+ 
+     /**
+-     *  Add a snapshot in database
++     *  Add a snapshot in database.
++     *  When $name is empty, the historical layout is preserved by storing
++     *  the Y-m-d date as the snapshot name.
+      */
+-    public function add(string $date, string $time, string $gpgSignature, array $arch, array $advancedParams, string $type, string $status, int $repoId): void
++    public function add(string $date, string $time, string $gpgSignature, array $arch, array $advancedParams, string $type, string $status, int $repoId, string $name = ''): void
+     {
+         // Convert advanced params to JSON string
+         try {
+@@ -75,7 +97,12 @@
+             throw new Exception('Error while encoding advanced parameters to JSON: ' . $e->getMessage());
+         }
+ 
+-        $this->model->add($date, $time, $gpgSignature, $arch, $advancedParams, $type, $status, $repoId);
++        // Validate the snapshot name early so a bad value cannot end up on disk
++        if ($name !== '') {
++            self::validateName($name);
++        }
++
++        $this->model->add($date, $time, $gpgSignature, $arch, $advancedParams, $type, $status, $repoId, $name);
+     }
+ 
+     /**
+@@ -174,12 +201,17 @@
+         foreach ($unusedSnapshots as $unusedSnapshot) {
+             $snapId            = $unusedSnapshot['snapId'];
+             $snapDate          = $unusedSnapshot['Date'];
++            // Snap_name carries the on-disk directory name (Y-m-d or Y-m-d_suffix);
++            // fall back to the Y-m-d date for legacy rows without a stored name.
++            $snapName          = !empty($unusedSnapshot['Snap_name'])
++                ? $unusedSnapshot['Snap_name']
++                : $snapDate;
+             $snapDateFormatted = DateTime::createFromFormat('Y-m-d', $snapDate)->format('d-m-Y');
+             $successful        = false;
+ 
+             if ($packageType == 'rpm') {
+-                if (is_dir(REPOS_DIR . '/rpm/' . $repoName . '/' . $repoReleasever . '/' . $snapDate)) {
+-                    $successful = Directory::deleteRecursive(REPOS_DIR . '/rpm/' . $repoName . '/' . $repoReleasever . '/' . $snapDate);
++                if (is_dir(REPOS_DIR . '/rpm/' . $repoName . '/' . $repoReleasever . '/' . $snapName)) {
++                    $successful = Directory::deleteRecursive(REPOS_DIR . '/rpm/' . $repoName . '/' . $repoReleasever . '/' . $snapName);
+                 }
+ 
+                 // Delete the parent directories if they are empty
+@@ -193,8 +225,8 @@
+             }
+ 
+             if ($packageType == 'deb') {
+-                if (is_dir(REPOS_DIR . '/deb/' . $repoName . '/' . $repoDist . '/' . $repoSection . '/' . $snapDate)) {
+-                    $successful = Directory::deleteRecursive(REPOS_DIR . '/deb/' . $repoName . '/' . $repoDist . '/' . $repoSection . '/' . $snapDate);
++                if (is_dir(REPOS_DIR . '/deb/' . $repoName . '/' . $repoDist . '/' . $repoSection . '/' . $snapName)) {
++                    $successful = Directory::deleteRecursive(REPOS_DIR . '/deb/' . $repoName . '/' . $repoDist . '/' . $repoSection . '/' . $snapName);
+                 }
+ 
+                 // Delete the parent directories if they are empty
+@@ -280,6 +312,38 @@
+     }
+ 
+     /**
++     *  Return true if a snapshot with the specified name already exists for the given repository
++     */
++    public function existsName(int $repoId, string $name) : bool
++    {
++        return $this->model->existsName($repoId, $name);
++    }
++
++    /**
++     *  Return snapshot name by ID (or the Y-m-d date for legacy rows)
++     */
++    public function getNameById(int $id): string
++    {
++        if (!$this->exists($id)) {
++            throw new Exception('Unknown snapshot ID #' . $id);
++        }
++
++        // getById() runs a plain "SELECT * FROM repos_snap" (no JOIN with
++        // repos), so the column keeps its real name here, unlike the
++        // Snap_name alias used where repos.Name would otherwise collide
++        // with repos_snap.Name (see Controllers\Repo\Repo::initializeData()).
++        $snapshot = $this->getById($id);
++
++        // Snapshots created before named-snapshots support lack the Name column,
++        // fall back to the Date value to keep the historical directory layout.
++        if (!empty($snapshot['Name'])) {
++            return $snapshot['Name'];
++        }
++
++        return $snapshot['Date'];
++    }
++
++    /**
+      *  Return true if a task is queued or running for the specified snapshot
+      */
+     public function taskRunning(int $snapId) : bool
+--- a/www/controllers/Task/Execution.php
++++ b/www/controllers/Task/Execution.php
+@@ -242,6 +242,7 @@
+             'source' => 'setSource',
+             'arch' => 'setArch',
+             'date' => 'setDate',
++            'snapshot-name' => 'setSnapshotName',
+             'releasever' => 'setReleasever',
+             'gpg-check' => 'setGpgCheck',
+             'gpg-sign' => 'setGpgSign',
+--- a/www/models/Connection.php
++++ b/www/models/Connection.php
+@@ -281,7 +281,8 @@
+         Type CHAR(6) NOT NULL,
+         Reconstruct CHAR(8), /* needed, running, failed */
+         Status CHAR(8) NOT NULL,
+-        Id_repo INTEGER NOT NULL)");
++        Id_repo INTEGER NOT NULL,
++        Name TEXT /* full snapshot name (Y-m-d or Y-m-d_suffix), used for on-disk directory */)");
+ 
+         /**
+          *  Create indexes
+--- a/www/models/Repo/Repo.php
++++ b/www/models/Repo/Repo.php
+@@ -62,6 +62,7 @@
+                 repos_snap.Reconstruct,
+                 repos_snap.Status,
+                 repos_snap.Id_repo,
++                repos_snap.Name AS Snap_name,
+                 repos_env.Id AS envId,
+                 repos_env.Env,
+                 repos_env.Description,
+@@ -95,7 +96,8 @@
+                 repos_snap.Type,
+                 repos_snap.Reconstruct,
+                 repos_snap.Status,
+-                repos_snap.Id_repo
++                repos_snap.Id_repo,
++                repos_snap.Name AS Snap_name
+                 FROM repos 
+                 INNER JOIN repos_snap
+                     ON repos_snap.Id_repo = repos.Id
+@@ -133,7 +135,8 @@
+                 repos_snap.Type,
+                 repos_snap.Reconstruct,
+                 repos_snap.Status,
+-                repos_snap.Id_repo
++                repos_snap.Id_repo,
++                repos_snap.Name AS Snap_name
+                 FROM repos
+                 INNER JOIN repos_snap
+                     ON repos_snap.Id_repo = repos.Id
+@@ -158,6 +161,7 @@
+                 repos_snap.Reconstruct,
+                 repos_snap.Status,
+                 repos_snap.Id_repo,
++                repos_snap.Name AS Snap_name,
+                 repos_env.Id AS envId,
+                 repos_env.Env,
+                 repos_env.Description,
+--- a/www/models/Repo/Snapshot/Snapshot.php
++++ b/www/models/Repo/Snapshot/Snapshot.php
+@@ -7,9 +7,58 @@
+ 
+ class Snapshot extends \Models\Model
+ {
++    /**
++     *  Per-process cache flag: once the Name column check ran successfully
++     *  for the lifetime of the current PHP process, skip the PRAGMA on every
++     *  subsequent instantiation of this model.
++     */
++    private static bool $nameColumnEnsured = false;
++
+     public function __construct()
+     {
+         $this->getConnection('main');
++        $this->ensureNameColumn();
++    }
++
++    /**
++     *  Ensure that the Name column exists in the repos_snap table.
++     *  Lazy migration: perform ALTER TABLE at runtime for existing databases
++     *  that were created before the Name column was introduced. The result is
++     *  cached in a static flag so PRAGMA table_info runs at most once per
++     *  process instead of on every model instantiation.
++     */
++    private function ensureNameColumn(): void
++    {
++        if (self::$nameColumnEnsured) {
++            return;
++        }
++
++        try {
++            $result = $this->db->query("PRAGMA table_info(repos_snap)");
++            if ($result === false) {
++                return;
++            }
++            $hasName = false;
++
++            while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
++                if ($row['name'] === 'Name') {
++                    $hasName = true;
++                    break;
++                }
++            }
++
++            if (!$hasName) {
++                // Legacy rows keep Name NULL on purpose. The Snap_name SELECT
++                // alias and Controllers\Repo\Repo::getSnapshotName() transparently
++                // fall back to Date, so no bulk UPDATE (and its write lock on
++                // large databases) is required here.
++                $this->db->exec("ALTER TABLE repos_snap ADD COLUMN Name TEXT");
++            }
++
++            self::$nameColumnEnsured = true;
++        } catch (Exception $e) {
++            DbLog::error($e);
++        }
+     }
+ 
+     /**
+@@ -64,7 +110,8 @@
+         try {
+             $stmt = $this->db->prepare("SELECT
+             repos_snap.Id AS snapId,
+-            repos_snap.Date
++            repos_snap.Date,
++            repos_snap.Name AS Snap_name
+             FROM repos
+             LEFT JOIN repos_snap
+                 ON repos_snap.Id_repo = repos.Id
+@@ -91,10 +138,16 @@
+     /**
+      *  Add a snapshot in database
+      */
+-    public function add(string $date, string $time, string $gpgSignature, array $arch, string $advancedParams, string $type, string $status, int $repoId): void
++    public function add(string $date, string $time, string $gpgSignature, array $arch, string $advancedParams, string $type, string $status, int $repoId, string $name = ''): void
+     {
+         try {
+-            $stmt = $this->db->prepare("INSERT INTO repos_snap ('Date', 'Time', 'Signed', 'Arch', 'Advanced_params', 'Type', 'Status', 'Id_repo') VALUES (:date, :time, :signed, :arch, :advancedParams, :type, :status, :repoId)");
++            // Fall back to the date if no explicit snapshot name is provided,
++            // preserving the historical on-disk directory layout.
++            if ($name === '') {
++                $name = $date;
++            }
++
++            $stmt = $this->db->prepare("INSERT INTO repos_snap ('Date', 'Time', 'Signed', 'Arch', 'Advanced_params', 'Type', 'Status', 'Id_repo', 'Name') VALUES (:date, :time, :signed, :arch, :advancedParams, :type, :status, :repoId, :name)");
+             $stmt->bindValue(':date', $date);
+             $stmt->bindValue(':time', $time);
+             $stmt->bindValue(':signed', $gpgSignature);
+@@ -103,6 +156,7 @@
+             $stmt->bindValue(':type', $type);
+             $stmt->bindValue(':status', $status);
+             $stmt->bindValue(':repoId', $repoId);
++            $stmt->bindValue(':name', $name);
+             $stmt->execute();
+         } catch (Exception $e) {
+             DbLog::error($e);
+@@ -225,6 +279,30 @@
+             $result = $stmt->execute();
+         } catch (Exception $e) {
+             DbLog::error($e);
++        }
++
++        if ($this->db->isempty($result) === true) {
++            return false;
++        }
++
++        return true;
++    }
++
++    /**
++     *  Return true if a snapshot with the specified name already exists for the given repository
++     */
++    public function existsName(int $repoId, string $name) : bool
++    {
++        try {
++            // Legacy rows keep Name NULL (see ensureNameColumn()); match those
++            // against Date too so collisions with pre-migration snapshots are
++            // still detected.
++            $stmt = $this->db->prepare("SELECT Id FROM repos_snap WHERE Id_repo = :repoId AND (Name = :name OR (Name IS NULL AND Date = :name)) AND Status = 'active'");
++            $stmt->bindValue(':repoId', $repoId);
++            $stmt->bindValue(':name', $name);
++            $result = $stmt->execute();
++        } catch (Exception $e) {
++            DbLog::error($e);
+         }
+ 
+         if ($this->db->isempty($result) === true) {

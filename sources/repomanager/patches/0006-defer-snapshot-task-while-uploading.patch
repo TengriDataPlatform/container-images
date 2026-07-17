@@ -1,0 +1,549 @@
+--- a/www/controllers/Filesystem/File.php
++++ b/www/controllers/Filesystem/File.php
+@@ -315,4 +315,106 @@
+ 
+         return $files;
+     }
++
++    /**
++     *  Return the advisory lock file path for a repository.
++     *  The lock lives outside the rpm/deb trees so it never ends up inside a
++     *  snapshot directory.
++     */
++    private static function repoLockPath(int $repoId) : string
++    {
++        $lockDir = REPOS_DIR . '/.locks';
++
++        // Create the lock directory if it does not exist yet
++        if (!is_dir($lockDir)) {
++            // Suppress errors: a concurrent process may create it at the same time
++            @mkdir($lockDir, 0770, true);
++        }
++
++        return $lockDir . '/repo-' . $repoId . '.lock';
++    }
++
++    /**
++     *  Acquire a shared (read) advisory lock on a repository.
++     *  Several uploads to the same repository can hold the shared lock at the
++     *  same time. A background snapshot task waiting on the exclusive lock will
++     *  block until every shared lock has been released.
++     *
++     *  The returned handle must be kept open for the whole duration of the
++     *  operation and released with unlockRepo(). If the process dies or the
++     *  service is restarted, the kernel releases the lock automatically, so
++     *  nothing stays stuck.
++     *
++     *  @return resource|null The open file handle, or null when locking is not
++     *                        possible (best-effort, never blocks the caller).
++     */
++    public static function lockRepoShared(int $repoId)
++    {
++        $handle = @fopen(self::repoLockPath($repoId), 'c');
++
++        // If the lock file cannot be opened, do not block the upload: return
++        // null and let the caller proceed without a lock (best-effort).
++        if ($handle === false) {
++            return null;
++        }
++
++        if (!flock($handle, LOCK_SH)) {
++            fclose($handle);
++            return null;
++        }
++
++        return $handle;
++    }
++
++    /**
++     *  Release a lock previously acquired with lockRepoShared().
++     *  @param resource|null $handle
++     */
++    public static function unlockRepo($handle) : void
++    {
++        if (!is_resource($handle)) {
++            return;
++        }
++
++        flock($handle, LOCK_UN);
++        fclose($handle);
++    }
++
++    /**
++     *  Wait until there is no active upload on the repository.
++     *  Takes the exclusive advisory lock, which blocks until every shared lock
++     *  held by ongoing uploads has been released, then releases it immediately:
++     *  we only need the barrier, not to keep holding it.
++     *
++     *  This is meant to be called by background tasks only, never from a web
++     *  request: a task can afford to wait, and no HTTP client times out here.
++     *
++     *  @param callable|null $onWait Optional callback invoked once, right before
++     *                               blocking, so the caller can log that it is
++     *                               waiting for uploads to finish.
++     */
++    public static function waitRepoIdle(int $repoId, callable $onWait = null) : void
++    {
++        $handle = @fopen(self::repoLockPath($repoId), 'c');
++
++        // If the lock file cannot be opened, there is nothing to wait for.
++        if ($handle === false) {
++            return;
++        }
++
++        // Non-blocking attempt first: if it succeeds, no upload is in progress
++        // and we can return without logging a spurious "waiting" message.
++        if (!flock($handle, LOCK_EX | LOCK_NB)) {
++            if (is_callable($onWait)) {
++                $onWait();
++            }
++
++            // Blocking wait until all shared locks (uploads) are released
++            flock($handle, LOCK_EX);
++        }
++
++        // Release immediately: the barrier has been crossed
++        flock($handle, LOCK_UN);
++        fclose($handle);
++    }
+ }
+--- a/www/controllers/Repo/Snapshot/Package.php
++++ b/www/controllers/Repo/Snapshot/Package.php
+@@ -20,6 +20,7 @@
+     private $snapshotPath;
+     private $repoController;
+     private $repoSnapshotController;
++    private $requestedWasLatest = false;
+ 
+     public function __construct(int $snapId)
+     {
+@@ -36,7 +37,33 @@
+         // Get repository information
+         $this->repoController->getAllById('', $this->snapId, '');
+ 
+-        // Define snapshot path
++        // Define snapshot path and download URL for the requested snapshot
++        $this->resolveSnapshotPath();
++
++        /**
++         *  Remember whether the requested snapshot was the latest one at the
++         *  time this controller was built. Only in that case an upload should
++         *  later be redirected to the (possibly newer) latest snapshot: if the
++         *  caller explicitly targeted an older snapshot, that is a deliberate
++         *  edit of that specific snapshot and must be honored as-is.
++         */
++        $latestSnapId = $this->repoController->getLatestSnapId($this->repoController->getRepoId());
++        $this->requestedWasLatest = (!empty($latestSnapId) and (int)$latestSnapId === $this->snapId);
++
++        // Check that the snapshot path exists
++        if (!is_dir($this->snapshotPath)) {
++            throw new Exception('Repository root directory ' . $this->snapshotPath . ' does not exist.');
++        }
++    }
++
++    /**
++     *  Compute snapshotPath and rootUrl from the repository information
++     *  currently loaded in $this->repoController.
++     *  The on-disk directory name comes from the snapshot name (which falls
++     *  back to the date for legacy snapshots).
++     */
++    private function resolveSnapshotPath() : void
++    {
+         if ($this->repoController->getPackageType() == 'rpm') {
+             $this->snapshotPath = REPOS_DIR .'/rpm/'. $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/' . $this->repoController->getSnapshotName();
+             $this->rootUrl = WWW_REPOS_DIR_URL . '/rpm/' . $this->repoController->getName() . '/' . $this->repoController->getReleasever() . '/' . $this->repoController->getSnapshotName();
+@@ -45,11 +72,6 @@
+             $this->snapshotPath = REPOS_DIR .'/deb/'. $this->repoController->getName() . '/'. $this->repoController->getDist() . '/' . $this->repoController->getSection() . '/' . $this->repoController->getSnapshotName();
+             $this->rootUrl = WWW_REPOS_DIR_URL . '/deb/' . $this->repoController->getName() . '/' . $this->repoController->getDist() . '/' . $this->repoController->getSection() . '/' . $this->repoController->getSnapshotName();
+         }
+-
+-        // Check that the snapshot path exists
+-        if (!is_dir($this->snapshotPath)) {
+-            throw new Exception('Repository root directory ' . $this->snapshotPath . ' does not exist.');
+-        }
+     }
+ 
+     /**
+@@ -131,185 +153,228 @@
+         }
+ 
+         /**
+-         *  Retrieve current repo architectures
+-         *  We will need this to update the repo architectures list if new packages are uploaded
++         *  Take a shared (read) lock on the repository for the whole duration
++         *  of the upload. It lets several uploads run in parallel while making
++         *  a background snapshot task wait (on the exclusive lock) before it
++         *  reads the source directory. The lock is released in the finally
++         *  block below, and the kernel releases it automatically if this
++         *  process dies, so nothing ever stays stuck.
+          */
+-        $currentArchs = $this->repoController->getArch();
+-
+-        // Check each file size to make sure it is not empty
+-        foreach ($packages as $package) {
+-            if ($package['size'] == 0) {
+-                throw new Exception('You must upload a file.');
+-            }
+-        }
+-
+-        foreach ($packages as $package) {
+-            $uploadError    = 0;
+-            $packageType    = mime_content_type($package['tmp_name']);
++        $repoLock = File::lockRepoShared($this->repoController->getRepoId());
+ 
++        try {
+             /**
+-             *  Package name must not contain special characters
+-             *  Only allow dashes and underscores and one more character: the dot (because package names contain dots)
++             *  If the upload was targeted at the snapshot that was the latest
++             *  one when this controller was built, redirect it to the current
++             *  latest snapshot. This way a package uploaded while a new
++             *  snapshot is being created lands in the fresh snapshot instead
++             *  of an about-to-be forgotten one. Deliberate uploads to an older
++             *  snapshot are left untouched (requestedWasLatest is false then).
+              */
+-            if (!Validate::alphaNumericHyphen($package['name'], ['.', '+', '~'])) {
+-                $uploadError++;
+-                $packageInvalidName[] = $package['name'];
+-                continue;
+-            }
++            if ($this->requestedWasLatest) {
++                $latestSnapId = $this->repoController->getLatestSnapId($this->repoController->getRepoId());
+ 
+-            // If the package is a .deb package, check that it contains the architecture in its name
+-            if ($this->repoController->getPackageType() == 'deb') {
+-                if (!preg_match('/(amd64|arm64|armel|armhf|i386|mips|mips64el|mipsel|ppc64el|s390x|all).deb$/', $package['name'])) {
+-                    throw new Exception('Package(s) name must contain the architecture in its name (e.g. package_amd64.deb).');
+-                }
+-            }
++                if (!empty($latestSnapId) and $latestSnapId != $this->snapId) {
++                    $this->snapId = $latestSnapId;
+ 
+-            // If package is in error or not actually an uploaded file, then we ignore it and move on to the next one
+-            if ($package['error'] != 0 || !is_uploaded_file($package['tmp_name'])) {
+-                $uploadError++;
+-                $packageError[] = $package['name'];
+-                continue;
+-            }
++                    // Reload repository information for the new target snapshot
++                    $this->repoController->getAllById('', $this->snapId, '');
+ 
+-            // If package size is equal to 0 then we ignore it and move on to the next one
+-            if ($package['size'] == 0) {
+-                $uploadError++;
+-                $packageEmpty[] = $package['name'];
+-                continue;
+-            }
++                    // Recompute snapshotPath and rootUrl for the new target
++                    $this->resolveSnapshotPath();
+ 
+-            // For DEB, package will be uploaded to the pool/<section> directory
+-            if ($this->repoController->getPackageType() == 'deb') {
+-                $targetDir = $this->snapshotPath . '/pool/' . $this->repoController->getSection();
++                    // Make sure the new target directory actually exists on disk
++                    if (!is_dir($this->snapshotPath)) {
++                        throw new Exception('Repository root directory ' . $this->snapshotPath . ' does not exist.');
++                    }
++                }
+             }
+ 
+             /**
+-             *  For RPM, package will be uploaded to the correct architecture subfolder
+-             *  Try to determine package architecture to move it to the correct subfolder
++             *  Retrieve current repo architectures
++             *  We will need this to update the repo architectures list if new packages are uploaded
+              */
+-            if ($this->repoController->getPackageType() == 'rpm') {
+-                foreach (RPM_ARCHS as $arch) {
+-                    if (preg_match("#\.$arch\.#", $package['name'])) {
+-                        $targetDir = $this->snapshotPath . '/packages/' . $arch;
++            $currentArchs = $this->repoController->getArch();
+ 
+-                        // If the architecture is not already in the list of architectures then we add it
+-                        if (!in_array($arch, $currentArchs)) {
+-                            $currentArchs[] = $arch;
+-                        }
+-
+-                        break;
+-                    }
++            // Check each file size to make sure it is not empty
++            foreach ($packages as $package) {
++                if ($package['size'] == 0) {
++                    throw new Exception('You must upload a file.');
+                 }
++            }
+ 
+-                // If the package is a source package then move it to the SRPMS subfolder
+-                if (preg_match("#\.src\.#", $package['name'])) {
+-                    $targetDir = $this->snapshotPath . '/packages/SRPMS';
+-
+-                    // If the architecture is not already in the list of architectures then we add it
+-                    if (!in_array('SRPMS', $currentArchs)) {
+-                        $currentArchs[] = 'SRPMS';
+-                    }
++            foreach ($packages as $package) {
++                $uploadError    = 0;
++                $packageType    = mime_content_type($package['tmp_name']);
++
++                /**
++                 *  Package name must not contain special characters
++                 *  Only allow dashes and underscores and one more character: the dot (because package names contain dots)
++                 */
++                if (!Validate::alphaNumericHyphen($package['name'], ['.', '+', '~'])) {
++                    $uploadError++;
++                    $packageInvalidName[] = $package['name'];
++                    continue;
+                 }
+ 
+-                // If no architecture has been found then we set it to 'noarch'
+-                if (empty($targetDir)) {
+-                    $targetDir = $this->snapshotPath . '/packages/noarch';
+-
+-                    // If the architecture is not already in the list of architectures then we add it
+-                    if (!in_array('noarch', $currentArchs)) {
+-                        $currentArchs[] = 'noarch';
++                // If the package is a .deb package, check that it contains the architecture in its name
++                if ($this->repoController->getPackageType() == 'deb') {
++                    if (!preg_match('/(amd64|arm64|armel|armhf|i386|mips|mips64el|mipsel|ppc64el|s390x|all).deb$/', $package['name'])) {
++                        throw new Exception('Package(s) name must contain the architecture in its name (e.g. package_amd64.deb).');
+                     }
+                 }
+-            }
+ 
+-            // Check that the package does not already exist, otherwise we ignore it and add it to a list of packages that already exist that we will display afterwards
+-            if (file_exists($targetDir . '/' . $package['name'])) {
+-                // If ignoreIfExists is enabled, skip the package and track it
+-                if ($ignoreIfExists) {
+-                    $packageIgnored[] = $package['name'];
++                // If package is in error or not actually an uploaded file, then we ignore it and move on to the next one
++                if ($package['error'] != 0 || !is_uploaded_file($package['tmp_name'])) {
++                    $uploadError++;
++                    $packageError[] = $package['name'];
+                     continue;
+                 }
+ 
+-                // If overwrite is disabled, skip the package and add it to the list of packages that already exist
+-                if (!$overwrite) {
++                // If package size is equal to 0 then we ignore it and move on to the next one
++                if ($package['size'] == 0) {
+                     $uploadError++;
+-                    $packageExists[] = $package['name'];
++                    $packageEmpty[] = $package['name'];
+                     continue;
+                 }
+ 
+-                // If overwrite is allowed, delete the existing package
+-                unlink($targetDir . '/' . $package['name']);
+-            }
++                // For DEB, package will be uploaded to the pool/<section> directory
++                if ($this->repoController->getPackageType() == 'deb') {
++                    $targetDir = $this->snapshotPath . '/pool/' . $this->repoController->getSection();
++                }
+ 
+-            // Check that the file has a valid mime type and said mime type matches the repo type
+-            if (!($packageType == 'application/x-rpm' && $this->repoController->getPackageType() == 'rpm') &&
+-                !($packageType == 'application/vnd.debian.binary-package' && $this->repoController->getPackageType() == 'deb')) {
+-                $uploadError++;
+-                $packageInvalid[] = $package['name'];
+-            }
++                /**
++                 *  For RPM, package will be uploaded to the correct architecture subfolder
++                 *  Try to determine package architecture to move it to the correct subfolder
++                 */
++                if ($this->repoController->getPackageType() == 'rpm') {
++                    foreach (RPM_ARCHS as $arch) {
++                        if (preg_match("#\.$arch\.#", $package['name'])) {
++                            $targetDir = $this->snapshotPath . '/packages/' . $arch;
++
++                            // If the architecture is not already in the list of architectures then we add it
++                            if (!in_array($arch, $currentArchs)) {
++                                $currentArchs[] = $arch;
++                            }
++
++                            break;
++                        }
++                    }
++
++                    // If the package is a source package then move it to the SRPMS subfolder
++                    if (preg_match("#\.src\.#", $package['name'])) {
++                        $targetDir = $this->snapshotPath . '/packages/SRPMS';
++
++                        // If the architecture is not already in the list of architectures then we add it
++                        if (!in_array('SRPMS', $currentArchs)) {
++                            $currentArchs[] = 'SRPMS';
++                        }
++                    }
++
++                    // If no architecture has been found then we set it to 'noarch'
++                    if (empty($targetDir)) {
++                        $targetDir = $this->snapshotPath . '/packages/noarch';
++
++                        // If the architecture is not already in the list of architectures then we add it
++                        if (!in_array('noarch', $currentArchs)) {
++                            $currentArchs[] = 'noarch';
++                        }
++                    }
++                }
++
++                // Check that the package does not already exist, otherwise we ignore it and add it to a list of packages that already exist that we will display afterwards
++                if (file_exists($targetDir . '/' . $package['name'])) {
++                    // If ignoreIfExists is enabled, skip the package and track it
++                    if ($ignoreIfExists) {
++                        $packageIgnored[] = $package['name'];
++                        continue;
++                    }
+ 
+-            // If there has been no error so far, then we can move the file to its final location
+-            if ($uploadError == 0 and file_exists($package['tmp_name'])) {
+-                // Create the target dir
+-                if (!is_dir($targetDir)) {
+-                    if (!mkdir($targetDir, 0770, true)) {
+-                        throw new Exception('Error: cannot create upload directory ' . $targetDir);
++                    // If overwrite is disabled, skip the package and add it to the list of packages that already exist
++                    if (!$overwrite) {
++                        $uploadError++;
++                        $packageExists[] = $package['name'];
++                        continue;
+                     }
++
++                    // If overwrite is allowed, delete the existing package
++                    unlink($targetDir . '/' . $package['name']);
+                 }
+ 
+-                if (!move_uploaded_file($package['tmp_name'], $targetDir . '/' . $package['name'])) {
++                // Check that the file has a valid mime type and said mime type matches the repo type
++                if (!($packageType == 'application/x-rpm' && $this->repoController->getPackageType() == 'rpm') &&
++                    !($packageType == 'application/vnd.debian.binary-package' && $this->repoController->getPackageType() == 'deb')) {
+                     $uploadError++;
+-                    $packageError[] = $package['name'];
+-                    continue;
++                    $packageInvalid[] = $package['name'];
+                 }
+ 
+-                // If the package has been moved successfully, we add it to the list of uploaded packages
+-                $packageUploaded[] = $package['name'];
+-            }
+-        }
++                // If there has been no error so far, then we can move the file to its final location
++                if ($uploadError == 0 and file_exists($package['tmp_name'])) {
++                    // Create the target dir
++                    if (!is_dir($targetDir)) {
++                        if (!mkdir($targetDir, 0770, true)) {
++                            throw new Exception('Error: cannot create upload directory ' . $targetDir);
++                        }
++                    }
+ 
+-        // If there was error during upload then we throw an exception
+-        if ($uploadError != 0) {
+-            $errorMessage = [];
++                    if (!move_uploaded_file($package['tmp_name'], $targetDir . '/' . $package['name'])) {
++                        $uploadError++;
++                        $packageError[] = $package['name'];
++                        continue;
++                    }
+ 
+-            if (!empty($packageInvalidName)) {
+-                $errorMessage['Following packages have invalid name and have not been uploaded'] = $packageInvalidName;
++                    // If the package has been moved successfully, we add it to the list of uploaded packages
++                    $packageUploaded[] = $package['name'];
++                }
+             }
+ 
+-            if (!empty($packageInvalid)) {
+-                $errorMessage['Following files are not considered valid packages and have not been uploaded'] = $packageInvalid;
+-            }
++            // If there was error during upload then we throw an exception
++            if ($uploadError != 0) {
++                $errorMessage = [];
+ 
+-            if (!empty($packageError)) {
+-                $errorMessage['Following packages encountered error and have not been uploaded'] = $packageError;
+-            }
++                if (!empty($packageInvalidName)) {
++                    $errorMessage['Following packages have invalid name and have not been uploaded'] = $packageInvalidName;
++                }
+ 
+-            if (!empty($packageEmpty)) {
+-                $errorMessage['Following packages are empty and have not been uploaded'] = $packageEmpty;
+-            }
++                if (!empty($packageInvalid)) {
++                    $errorMessage['Following files are not considered valid packages and have not been uploaded'] = $packageInvalid;
++                }
+ 
+-            if (!empty($packageExists)) {
+-                $errorMessage['Following packages already exist and have not been uploaded'] = $packageExists;
+-            }
++                if (!empty($packageError)) {
++                    $errorMessage['Following packages encountered error and have not been uploaded'] = $packageError;
++                }
+ 
+-            if (!empty($packageIgnored)) {
+-                $errorMessage['Following packages already exist and have been ignored'] = $packageIgnored;
+-            }
++                if (!empty($packageEmpty)) {
++                    $errorMessage['Following packages are empty and have not been uploaded'] = $packageEmpty;
++                }
+ 
+-            throw new AppException($errorMessage);
+-        }
++                if (!empty($packageExists)) {
++                    $errorMessage['Following packages already exist and have not been uploaded'] = $packageExists;
++                }
+ 
+-        // Set repo rebuild status to 'needed'
+-        $this->repoSnapshotController->updateRebuild($this->snapId, 'needed');
++                if (!empty($packageIgnored)) {
++                    $errorMessage['Following packages already exist and have been ignored'] = $packageIgnored;
++                }
+ 
+-        // Set new repo architectures
+-        $this->repoSnapshotController->updateArch($this->snapId, $currentArchs);
++                throw new AppException($errorMessage);
++            }
+ 
+-        if (!empty($packageUploaded)) {
+-            $return['Following packages have been uploaded successfully'] = $packageUploaded;
+-        }
+-        if (!empty($packageIgnored)) {
+-            $return['Following packages already exist and have been ignored'] = $packageIgnored;
++            // Set repo rebuild status to 'needed'
++            $this->repoSnapshotController->updateRebuild($this->snapId, 'needed');
++
++            // Set new repo architectures
++            $this->repoSnapshotController->updateArch($this->snapId, $currentArchs);
++
++            if (!empty($packageUploaded)) {
++                $return['Following packages have been uploaded successfully'] = $packageUploaded;
++            }
++            if (!empty($packageIgnored)) {
++                $return['Following packages already exist and have been ignored'] = $packageIgnored;
++            }
++        } finally {
++            // Always release the repository lock, even if an AppException was
++            // thrown above while reporting per-package upload errors.
++            File::unlockRepo($repoLock);
+         }
+ 
+         return $return;
+--- a/www/controllers/Repo/Task/Update.php
++++ b/www/controllers/Repo/Task/Update.php
+@@ -141,6 +141,19 @@
+         }
+ 
+         /**
++         *  Wait for any in-progress package upload on the source repository to
++         *  finish before reading the previous snapshot directory. Uploads write
++         *  straight into that directory, so reading/hardlinking it while a big
++         *  package is still being moved could miss files or fail on a package
++         *  removed mid-flight (overwrite). This is a background task: it can
++         *  afford to wait, and no HTTP client is blocked by this.
++         */
++        File::waitRepoIdle($this->sourceRepoController->getRepoId(), function () {
++            $this->taskLogSubStepController->new('waiting-uploads', 'WAITING FOR ACTIVE UPLOADS TO FINISH');
++            $this->taskLogSubStepController->completed();
++        });
++
++        /**
+          *  If working directory already exists, delete it
+          */
+         if (is_dir($workingDir)) {

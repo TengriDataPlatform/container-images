@@ -1,0 +1,89 @@
+--- a/www/controllers/Repo/Snapshot/Package.php
++++ b/www/controllers/Repo/Snapshot/Package.php
+@@ -11,6 +11,7 @@
+ use Controllers\Utils\Validate;
+ use Controllers\Utils\Convert;
+ use Controllers\Repo\Repo;
++use Controllers\Process;
+ use Exception;
+ 
+ class Package
+@@ -323,6 +324,23 @@
+                         continue;
+                     }
+ 
++                    /**
++                     *  For RPM, sign the freshly uploaded package right away.
++                     *  Uploads are the only entry point that writes packages
++                     *  straight into a snapshot without going through the
++                     *  create/rebuild signing step, so an unsigned package
++                     *  would otherwise be propagated as-is (via hardlinks) to
++                     *  every snapshot derived from this one through an update.
++                     *  Signing here, on the fresh inode produced by
++                     *  move_uploaded_file(), keeps the on-disk package signed
++                     *  no matter how it is later published. DEB does not need
++                     *  this because for deb it is the Release metadata file
++                     *  that is signed, not the individual packages.
++                     */
++                    if ($this->repoController->getPackageType() == 'rpm') {
++                        $this->signRpmPackage($targetDir . '/' . $package['name']);
++                    }
++
+                     // If the package has been moved successfully, we add it to the list of uploaded packages
+                     $packageUploaded[] = $package['name'];
+                 }
+@@ -381,6 +399,54 @@
+     }
+ 
+     /**
++     *  Sign a single RPM package in place with the repository GPG key.
++     *  Reuses the exact same rpmsign invocation as the task-side signing
++     *  (Controllers\Repo\Package\Sign) so both paths behave identically.
++     *  On failure the offending package is removed and an exception is
++     *  thrown, mirroring the RPM_SIGNATURE_FAIL='error' behavior: a broken
++     *  or unsigned package must never be left behind in the snapshot.
++     */
++    private function signRpmPackage(string $rpmFile): void
++    {
++        // The rpm macros file (written by Controllers\Gpg::generateRpmMacros
++        // during application setup) drives how rpmsign calls gpg. Without it
++        // signing cannot happen, so fail loudly instead of silently shipping
++        // an unsigned package.
++        if (!defined('MACROS_FILE') or !file_exists(MACROS_FILE)) {
++            unlink($rpmFile);
++            throw new Exception('GPG macros file for rpm does not exist, cannot sign uploaded package.');
++        }
++
++        if (!file_exists($rpmFile)) {
++            throw new Exception('RPM file <code>' . $rpmFile . '</code> not found (deleted?).');
++        }
++
++        // Sign the package. GPG_TTY mirrors Controllers\Repo\Package\Sign so
++        // that gpg behaves the same whether signing happens on upload or in a
++        // background task.
++        $myprocess = new Process('/usr/bin/rpmsign --macros=' . MACROS_FILE . ' --addsign ' . $rpmFile, array('GPG_TTY' => '$(tty)'));
++        $myprocess->execute();
++        $output = $myprocess->getOutput();
++        $exitCode = $myprocess->getExitCode();
++        $myprocess->close();
++
++        /**
++         *  rpmsign is idempotent: re-signing a package that already carries an
++         *  identical signature exits non-zero with this specific warning. Treat
++         *  that as success so overwriting an already-signed package does not
++         *  wrongly delete it.
++         */
++        if ($exitCode != 0 and !preg_match('/already contains identical signature, skipping/', $output)) {
++            // Remove the unsigned package so the snapshot never keeps it
++            if (file_exists($rpmFile)) {
++                unlink($rpmFile);
++            }
++
++            throw new Exception('Error while signing uploaded package <code>' . basename($rpmFile) . '</code><br><pre class="codeblock margin-top-10">' . $output . '</pre>');
++        }
++    }
++
++    /**
+      *  Delete files from snapshot
+      */
+     public function delete(array $files): array

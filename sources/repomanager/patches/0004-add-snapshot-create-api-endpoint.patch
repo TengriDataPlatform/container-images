@@ -1,0 +1,192 @@
+--- a/www/controllers/Api/Repo/Repo.php
++++ b/www/controllers/Api/Repo/Repo.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Controllers\Api\Repo;
+ 
++use Controllers\Task\Task;
+ use Exception;
+ 
+ class Repo extends \Controllers\Api\Controller
+@@ -69,6 +70,116 @@
+ 
+                 return ['results' => $snapshots];
+             }
++
++            /**
++             *  Create a new snapshot for the repository (update action).
++             *  https://repomanager.mydomain.net/api/v2/repo/{repo-id}/snapshot
++             *
++             *  Body parameters (JSON):
++             *    - snapshot-name : optional URL-safe label used as the on-disk
++             *                      directory name; falls back to today's date
++             *                      when omitted. Pattern: [A-Za-z0-9][A-Za-z0-9._-]*.
++             *    - gpg-sign      : optional bool string ('true'|'false'), default 'false'.
++             *    - gpg-check     : optional bool string ('true'|'false'), default 'false'
++             *                      (mirror repos only).
++             *    - arch          : optional string of comma-separated architectures,
++             *                      or array. Required for mirror repos.
++             *    - env           : optional array of environment names to point at
++             *                      the freshly created snapshot.
++             *    - description   : optional string.
++             *    - advanced-params : optional array passed through untouched.
++             *
++             *  Returns 202 Accepted with the task Id so the caller can poll status.
++             */
++            if ($this->method == 'POST' and $this->action == 'snapshot') {
++                // Check if the repository exists
++                if (!$repoController->existsId($this->repoId)) {
++                    throw new Exception('Repository does not exist');
++                }
++
++                // Load repository details (needed to know package-type and existing snapshots)
++                $repoController->getAllById($this->repoId);
++                $latestSnapId = $repoController->getLatestSnapId($this->repoId);
++                if (empty($latestSnapId)) {
++                    throw new Exception('Repository has no active snapshot to update from');
++                }
++
++                // Build task params, mimicking the update form output
++                $params = [];
++                $params['action']       = 'update';
++                $params['repo-id']      = (string) $this->repoId;
++                $params['snap-id']      = (string) $latestSnapId;
++                $params['schedule']['scheduled'] = 'false';
++
++                // Optional snapshot name — validated here to fail fast (400 vs 500 later)
++                if (!empty($this->data['snapshot-name'])) {
++                    \Controllers\Repo\Snapshot\Snapshot::validateName($this->data['snapshot-name']);
++                    $params['snapshot-name'] = (string) $this->data['snapshot-name'];
++                }
++
++                // GPG sign flag (default: false)
++                $gpgSign = 'false';
++                if (isset($this->data['gpg-sign'])) {
++                    if (!in_array($this->data['gpg-sign'], ['true', 'false'], true)) {
++                        throw new Exception('Invalid gpg-sign value (expected "true" or "false")');
++                    }
++                    $gpgSign = $this->data['gpg-sign'];
++                }
++                $params['gpg-sign'] = $gpgSign;
++
++                // GPG check flag (default: false, mirror repos only)
++                $params['gpg-check'] = isset($this->data['gpg-check']) && $this->data['gpg-check'] === 'true' ? 'true' : 'false';
++
++                // Architecture list: use client-provided value, otherwise
++                // inherit from the latest snapshot so that the update
++                // action's conditional-required check passes for both
++                // mirror and local repos. Local repos keep their arch in
++                // repos_snap (not in repos), so reading it from the
++                // snapshot is the only reliable source here.
++                if (!empty($this->data['arch'])) {
++                    if (is_array($this->data['arch'])) {
++                        $params['arch'] = $this->data['arch'];
++                    } else {
++                        $params['arch'] = array_map('trim', explode(',', (string) $this->data['arch']));
++                    }
++                } else {
++                    $snapController = new \Controllers\Repo\Snapshot\Snapshot();
++                    $snapData = $snapController->getById((int) $latestSnapId);
++                    $snapArch = !empty($snapData['Arch']) ? (string) $snapData['Arch'] : '';
++                    if ($snapArch === '') {
++                        throw new Exception('Latest snapshot #' . $latestSnapId . ' has no architecture set and no "arch" parameter was provided');
++                    }
++                    $params['arch'] = array_map('trim', explode(',', $snapArch));
++                }
++
++                // Optional env list (must be an array of names)
++                if (!empty($this->data['env'])) {
++                    if (!is_array($this->data['env'])) {
++                        throw new Exception('Parameter "env" must be an array of environment names');
++                    }
++                    $params['env'] = $this->data['env'];
++                }
++
++                // Optional description
++                if (!empty($this->data['description'])) {
++                    $params['description'] = (string) $this->data['description'];
++                }
++
++                // Optional advanced-params passthrough
++                if (!empty($this->data['advanced-params']) and is_array($this->data['advanced-params'])) {
++                    $params['advanced-params'] = $this->data['advanced-params'];
++                }
++
++                // Kick off the task in background
++                $taskController = new Task();
++                $taskId = $taskController->execute([$params]);
++
++                return [
++                    'rc'      => 202,
++                    'results' => 'Snapshot creation task started',
++                    'task-id' => $taskId,
++                ];
++            }
+         }
+ 
+         throw new Exception('Invalid request');
+--- a/www/controllers/Task/Task.php
++++ b/www/controllers/Task/Task.php
+@@ -710,8 +710,16 @@
+             }
+ 
+ 
+-            // Check if task is a scheduled task
+-            if ($taskRawParams['schedule']['scheduled'] != 'true') {
++            // A scheduled task can always be deleted. Non-scheduled tasks
++            // are normally handled by the task runner (running -> done/failed),
++            // but a task can get stuck in 'queued' or end up in 'failed' when
++            // Execution::__construct() aborted before start() was reached.
++            // Allow deleting such orphaned tasks from the UI so they are not
++            // pinned in the queue list forever.
++            $status = $task['Status'] ?? '';
++            $scheduled = ($taskRawParams['schedule']['scheduled'] ?? 'false') == 'true';
++            $deletable = ['queued', 'failed', 'done'];
++            if (!$scheduled and !in_array($status, $deletable, true)) {
+                 throw new Exception('Task #' . $id . ' is not a scheduled task and cannot be deleted');
+             }
+ 
+--- a/www/tasks/execute.php
++++ b/www/tasks/execute.php
+@@ -26,6 +26,25 @@
+  */
+ $getOptions = getopt(null, ["id:"]);
+ 
++/**
++ *  Mark the task as failed. Called from both the exception and fatal
++ *  error handlers below to make sure the task does not stay stuck in
++ *  'queued' when the controller aborted before Execution::start() had
++ *  a chance to flip the status. Secondary failures are ignored here —
++ *  we are already in the error path.
++ */
++function markTaskFailed(\Controllers\Task\Task $myTask, ?int $taskId) : void
++{
++    if (empty($taskId)) {
++        return;
++    }
++
++    try {
++        $myTask->updateStatus((int) $taskId, 'failed');
++    } catch (Throwable $ignored) {
++    }
++}
++
+ try {
+     /**
+      *  If a task Id is provided, use it.
+@@ -178,6 +197,7 @@
+     // $mylog->log('error', 'An exception error occurred while running task #' . $taskId, $e->getMessage(), $e->getTraceAsString());
+     echo 'Error: ' . $e->getMessage() . ' in ' . $e->getFile() . ' on line ' . $e->getLine() . PHP_EOL;
+     echo 'Task #' . $taskId . ' failed' . PHP_EOL;
++    markTaskFailed($myTask, $taskId ?? null);
+     exit(1);
+ 
+ /**
+@@ -187,6 +207,7 @@
+     $mylog->log('error', 'A fatal error occurred while running task #' . $taskId, $e->getMessage(), $e->getTraceAsString());
+     echo 'Fatal error: ' . $e->getMessage() . ' in ' . $e->getFile() . ' on line ' . $e->getLine() . PHP_EOL;
+     echo 'Task #' . $taskId . ' failed' . PHP_EOL;
++    markTaskFailed($myTask, $taskId ?? null);
+     exit(1);
+ }
+ 
