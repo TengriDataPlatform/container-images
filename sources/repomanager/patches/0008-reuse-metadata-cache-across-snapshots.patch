@@ -1,0 +1,683 @@
+--- a/www/controllers/Filesystem/File.php
++++ b/www/controllers/Filesystem/File.php
+@@ -317,6 +317,18 @@
+     }
+ 
+     /**
++     *  Return the stable per-repository deb build directory used to reuse
++     *  apt-ftparchive's metadata cache across snapshots (see
++     *  Update::updateLocal()). Centralized here so the path scheme is
++     *  defined in a single place instead of being rebuilt in every caller
++     *  (Update, Delete, Rename).
++     */
++    public static function debBuildDir(string $name, string $dist, string $section) : string
++    {
++        return REPOS_DIR . '/.build/deb/' . $name . '/' . $dist . '/' . $section;
++    }
++
++    /**
+      *  Return the advisory lock file path for a repository.
+      *  The lock lives outside the rpm/deb trees so it never ends up inside a
+      *  snapshot directory.
+@@ -417,4 +429,55 @@
+         flock($handle, LOCK_UN);
+         fclose($handle);
+     }
++
++    /**
++     *  Wait until there is no active upload on the repository, then acquire
++     *  and hold the exclusive lock on it. Unlike waitRepoIdle(), the lock is
++     *  NOT released before returning: the caller is responsible for calling
++     *  unlockRepo() once its own snapshot task (create/update/rebuild/duplicate)
++     *  has fully completed.
++     *
++     *  This serializes snapshot tasks on the same repository: while one task
++     *  holds the exclusive lock, any other snapshot task on the same repoId
++     *  blocks here until the first one releases it. Uploads (shared lock) are
++     *  also blocked from starting while a snapshot task holds this lock.
++     *
++     *  This is meant to be called by background tasks only, never from a web
++     *  request: a task can afford to wait, and no HTTP client times out here.
++     *
++     *  @param callable|null $onWait Optional callback invoked once, right before
++     *                               blocking, so the caller can log that it is
++     *                               waiting for uploads/other snapshot tasks.
++     *  @return resource|null The open, locked file handle, or null when
++     *                        locking is not possible (best-effort, never
++     *                        blocks the caller in that case).
++     */
++    public static function waitAndLockRepoExclusive(int $repoId, ?callable $onWait = null)
++    {
++        $handle = @fopen(self::repoLockPath($repoId), 'c');
++
++        // If the lock file cannot be opened, there is nothing to wait for or
++        // lock: let the caller proceed without a lock (best-effort).
++        if ($handle === false) {
++            return null;
++        }
++
++        // Non-blocking attempt first: if it succeeds, no upload nor other
++        // snapshot task is in progress, and we can return without logging a
++        // spurious "waiting" message.
++        if (!flock($handle, LOCK_EX | LOCK_NB)) {
++            if (is_callable($onWait)) {
++                $onWait();
++            }
++
++            // Blocking wait until the lock (uploads or another snapshot task) is released
++            if (!flock($handle, LOCK_EX)) {
++                fclose($handle);
++                return null;
++            }
++        }
++
++        // Keep the lock held: the caller releases it via unlockRepo() once done
++        return $handle;
++    }
+ }
+--- a/www/controllers/Repo/Metadata/Create.php
++++ b/www/controllers/Repo/Metadata/Create.php
+@@ -14,7 +14,18 @@
+      */
+     private function createMetadata() : void
+     {
+-        $workingDir = REPOS_DIR . '/temporary-task-' . $this->taskId;
++        /**
++         *  Working directory the metadata generator runs against. If a task
++         *  has already set one (Update::updateLocal() does this for deb, so
++         *  apt-ftparchive works against a stable per-repository path and its
++         *  BinCacheDB can be reused across snapshots), use it. Otherwise, fall
++         *  back to the historical per-task path.
++         */
++        if (!empty($this->workingDir)) {
++            $workingDir = $this->workingDir;
++        } else {
++            $workingDir = REPOS_DIR . '/temporary-task-' . $this->taskId;
++        }
+ 
+         $this->taskLogStepController->new('create-repo-metadata', 'CREATING REPOSITORY');
+ 
+@@ -35,10 +46,24 @@
+             $workingDir = $snapshotPath;
+         }
+ 
++        /**
++         *  If a previous snapshot directory is known (set by Update::updateLocal(),
++         *  the only place that ever populates it), pass it along so the
++         *  metadata generator can reuse its cache instead of reindexing every
++         *  package from scratch:
++         *    - deb: apt-ftparchive BinCacheDB (cache/packages-*.db)
++         *    - rpm: createrepo_c --update against the previous repodata
++         */
++        $previousSnapshotDir = null;
++        if ($this->action == 'update' and !empty($this->previousSnapshotDir)) {
++            $previousSnapshotDir = $this->previousSnapshotDir;
++        }
++
+         // Generate repository metadata
+         if ($this->repoController->getPackageType() == 'rpm') {
+             $mymetadata = new RpmMetadata($this->taskId);
+             $mymetadata->setRoot($workingDir);
++            $mymetadata->setPreviousSnapshotPath($previousSnapshotDir);
+             $mymetadata->create();
+         }
+ 
+@@ -51,6 +76,7 @@
+             $mymetadata->setArch($this->repoController->getArch());
+             $mymetadata->setGpgSign($this->repoController->getGpgSign());
+             $mymetadata->setMetadataCustomFields($this->repoController->getAdvancedParams()['metadata-custom-fields'] ?? []);
++            $mymetadata->setPreviousSnapshotPath($previousSnapshotDir);
+             $mymetadata->create();
+         }
+ 
+--- a/www/controllers/Repo/Metadata/Deb.php
++++ b/www/controllers/Repo/Metadata/Deb.php
+@@ -16,12 +16,31 @@
+     private $gpgSign = false;
+     private $aptftparchive = '/usr/bin/apt-ftparchive';
+     private $customFields = [];
++    private $previousSnapshotPath = null;
+ 
+     public function setRoot(string $root): void
+     {
+         $this->root = $root;
+     }
+ 
++    /**
++     *  Path to the previous snapshot directory (if any), used to reuse its
++     *  apt-ftparchive BinCacheDB files (cache/packages-*.db) instead of
++     *  reindexing every package from scratch.
++     *
++     *  This only works if the current run's working directory ($this->root)
++     *  matches the working directory that produced the previous cache: the
++     *  BinCacheDB keys every entry by the absolute package path, so a
++     *  different working directory would make every lookup miss. Callers
++     *  must therefore use a stable per-repository working path (see
++     *  Update::updateLocal() for deb) when they set a previous snapshot
++     *  path here; passing null disables the reuse.
++     */
++    public function setPreviousSnapshotPath(?string $path): void
++    {
++        $this->previousSnapshotPath = $path;
++    }
++
+     public function setRepo(string $repo): void
+     {
+         $this->repo = $repo;
+@@ -94,11 +113,24 @@
+ 
+         /**
+          *  First, clean all of these directories if they already exist (.e.g if the repository is being rebuilt or it is a duplicate of another one)
+-         *  Clean all but 'pool' directory, because it might contain packages to add to the repository (e.g. if the repository is being rebuilt or it is a duplicate of another one)
++         *  Clean all but:
++         *    - 'pool' directory, because it might contain packages to add to
++         *      the repository (e.g. if the repository is being rebuilt or it
++         *      is a duplicate of another one),
++         *    - 'cache' directory, because it holds the apt-ftparchive
++         *      BinCacheDB files (packages-*.db) that we want to keep: on a
++         *      rebuild the working directory IS the snapshot directory
++         *      itself, but note that its entries were keyed by the absolute
++         *      path of the stable build directory used by 'create'/'update'
++         *      (.build/... or temporary-task-<taskId>), not by this snapshot
++         *      path, so the very first rebuild after a create/update will not
++         *      get any cache hit here; apt-ftparchive still records new
++         *      entries keyed by this path as it processes packages, so any
++         *      subsequent rebuild of the same snapshot will reuse them.
+          */
+         foreach ($dirs as $dir) {
+-            // Skip pool directory
+-            if ($dir == 'pool') {
++            // Skip pool and cache directories
++            if ($dir == 'pool' or $dir == 'cache') {
+                 continue;
+             }
+ 
+@@ -119,6 +151,45 @@
+             }
+         }
+ 
++        /**
++         *  Reuse apt-ftparchive's BinCacheDB from the previous snapshot, if any.
++         *  This cache maps each package (by its absolute path, then validated
++         *  by mtime and size) to its already computed control fields,
++         *  MD5/SHA1/SHA256 sums and, for Contents generation, its file list.
++         *  Packages carried over from the previous snapshot are hardlinked
++         *  into the same stable working directory (see Update::updateLocal()
++         *  for deb), so the exact absolute paths, inodes, mtimes and sizes
++         *  match between runs: apt-ftparchive recognizes them as unchanged
++         *  via the cache and skips reading their content entirely; only truly
++         *  new packages get indexed. Cache files are copied (not hardlinked)
++         *  into the new working directory so that apt-ftparchive's in-place
++         *  BerkeleyDB writes never touch the previous snapshot's own cache.
++         *  Best-effort: if copying fails for any reason, apt-ftparchive just
++         *  falls back to indexing everything.
++         */
++        if (!empty($this->previousSnapshotPath) and is_dir($this->previousSnapshotPath . '/cache')) {
++            $previousCacheFiles = glob($this->previousSnapshotPath . '/cache/packages-*.db');
++
++            if (!empty($previousCacheFiles)) {
++                foreach ($previousCacheFiles as $previousCacheFile) {
++                    if (!is_dir($this->root . '/cache')) {
++                        mkdir($this->root . '/cache', 0770, true);
++                    }
++                    $targetCacheFile = $this->root . '/cache/' . basename($previousCacheFile);
++
++                    if (!@copy($previousCacheFile, $targetCacheFile)) {
++                        // Remove a possible partial copy: apt-ftparchive cannot
++                        // open a truncated/corrupt BerkeleyDB file and would
++                        // fail instead of falling back to full reindexing
++                        @unlink($targetCacheFile);
++                        $this->taskLogSubStepController->warning('Could not reuse previous metadata cache file ' . $previousCacheFile . ', metadata will be fully regenerated');
++                    }
++                }
++            }
++
++            unset($previousCacheFiles);
++        }
++
+         // Create apt-ftparchive.conf file
+         if (!file_put_contents($this->root . '/apt-ftparchive.conf', $this->generateAptFtpArchiveConf())) {
+             throw new Exception('Failed to create apt-ftparchive.conf file');
+@@ -130,7 +201,7 @@
+         }
+ 
+         // Create Packages file
+-        $myprocess = new Process($this->aptftparchive . ' generate ' . $this->root . '/apt-ftparchive.conf');
++        $myprocess = new Process($this->aptftparchive . ' -o APT::FTPArchive::AlwaysStat=true generate ' . $this->root . '/apt-ftparchive.conf');
+         $myprocess->setBackground(true);
+         $myprocess->execute();
+ 
+--- a/www/controllers/Repo/Metadata/Rpm.php
++++ b/www/controllers/Repo/Metadata/Rpm.php
+@@ -10,6 +10,7 @@
+     private $root;
+     private $createrepo = '/usr/bin/createrepo_c';
+     private $createrepoArgs = '-v --compress-type=gz --general-compress-type=gz';
++    private $previousSnapshotPath = null;
+     // private $modifyrepo = '/usr/bin/modifyrepo_c';
+ 
+     public function setRoot(string $root)
+@@ -18,6 +19,18 @@
+     }
+ 
+     /**
++     *  Path to the previous snapshot directory (if any), used to reuse its
++     *  repodata via createrepo_c --update instead of recomputing checksums
++     *  for every package from scratch. Pass null when there is no relevant
++     *  previous snapshot (e.g. first snapshot of a repository, or a
++     *  rebuild/duplicate that already works on its own existing directory).
++     */
++    public function setPreviousSnapshotPath(?string $path): void
++    {
++        $this->previousSnapshotPath = $path;
++    }
++
++    /**
+      *  Create metadata files
+      */
+     public function create(): void
+@@ -39,6 +52,22 @@
+ 
+         $this->taskLogSubStepController->new('create-metadata', 'GENERATING REPOSITORY METADATA');
+ 
++        /**
++         *  Reuse the previous snapshot's repodata, if any, via createrepo_c's
++         *  --update mode: for every package whose mtime and size match an
++         *  entry already present in the referenced repodata, createrepo_c
++         *  reuses the existing metadata chunk instead of recomputing
++         *  checksums and reading package headers again. Packages carried over
++         *  from the previous snapshot are hardlinked (see
++         *  Update::updateLocal()), so they keep the same mtime and size, and
++         *  only truly new/changed packages get fully processed. Reading the
++         *  previous repodata is safe without copying it first: createrepo_c
++         *  only reads from --update-md-path, it never writes into it.
++         */
++        if (!empty($this->previousSnapshotPath) and is_dir($this->previousSnapshotPath . '/repodata')) {
++            $this->createrepoArgs .= ' --update --update-md-path=' . $this->previousSnapshotPath;
++        }
++
+         // Create repository metadata
+         $myprocess = new Process($this->createrepo . ' ' . $this->createrepoArgs . ' ' . $this->root . '/');
+         $myprocess->setBackground(true);
+--- a/www/controllers/Repo/Task/Duplicate.php
++++ b/www/controllers/Repo/Task/Duplicate.php
+@@ -32,7 +32,7 @@
+             // Throw back the exception to be caught by the main script
+             throw new Exception($e->getMessage());
+         } finally {
+-            // End the task
++            // End the task (also releases the repository lock, if any was taken)
+             $this->end();
+         }
+     }
+@@ -46,6 +46,20 @@
+         $this->taskLogSubStepController->new('initializing', 'INITIALIZING');
+ 
+         /**
++         *  Wait for any in-progress upload or other snapshot task on the
++         *  source repository to finish, then hold the exclusive lock until
++         *  this task ends: we are about to read every file of its snapshot
++         *  directory. This is a background task: it can afford to wait, and
++         *  no HTTP client is blocked by this.
++         */
++        $this->lockRepoExclusive($this->sourceRepoController->getRepoId());
++
++        // Mark the current substep ('waiting-repo-lock' if we had to wait for
++        // the lock, 'initializing' otherwise) as completed only now that the
++        // lock has actually been acquired
++        $this->taskLogSubStepController->completed();
++
++        /**
+          *  Check if source repo snapshot exists
+          */
+         if ($this->sourceRepoController->existsSnapId($this->sourceRepoController->getSnapId()) === false) {
+--- a/www/controllers/Repo/Task/Rebuild.php
++++ b/www/controllers/Repo/Task/Rebuild.php
+@@ -26,7 +26,7 @@
+             // Throw back the exception to be caught by the main script
+             throw new Exception($e->getMessage());
+         } finally {
+-            // End the task
++            // End the task (also releases the repository lock, if any was taken)
+             $this->end();
+         }
+     }
+@@ -37,6 +37,18 @@
+     public function execute()
+     {
+         /**
++         *  Wait for any in-progress upload or other snapshot task on this
++         *  repository to finish, then hold the exclusive lock until this task
++         *  ends. This is a background task: it can afford to wait, and no
++         *  HTTP client is blocked by this.
++         */
++        $this->lockRepoExclusive($this->repoController->getRepoId());
++
++        // Mark the substep as completed only now that the lock has actually
++        // been acquired (it was still waiting for it inside the callback above)
++        $this->taskLogSubStepController->completed();
++
++        /**
+          *  Set snapshot metadata rebuild state in database
+          */
+         $this->repoSnapshotController->updateRebuild($this->repoController->getSnapId(), 'running');
+--- a/www/controllers/Repo/Task/Update.php
++++ b/www/controllers/Repo/Task/Update.php
+@@ -33,7 +33,7 @@
+             // Throw back the exception to be caught by the main script
+             throw new Exception($e->getMessage());
+         } finally {
+-            // End the task
++            // End the task (also releases the repository lock, if any was taken)
+             $this->end();
+         }
+     }
+@@ -94,9 +94,54 @@
+         $this->taskLogSubStepController->new('initializing', 'INITIALIZING');
+ 
+         /**
+-         *  Define temporary working directory
+-         */
+-        $workingDir = REPOS_DIR . '/temporary-task-' . $this->taskId;
++         *  Wait for any in-progress package upload on the source repository to
++         *  finish, and for any other snapshot task on the same repository to
++         *  complete, then hold the exclusive lock until this task ends. Taken
++         *  upfront, before any check against the previous snapshot directory
++         *  below, so a concurrent task (e.g. a Delete) cannot alter or remove
++         *  it between the check and the point where we actually read it.
++         *  Uploads write straight into that directory, so reading/hardlinking
++         *  it while a big package is still being moved could miss files or
++         *  fail on a package removed mid-flight (overwrite). Serializing
++         *  snapshot tasks per repository also avoids two tasks racing to
++         *  reuse/rewrite the same metadata cache (see createMetadata()) and,
++         *  for deb, the same shared working directory. This is a background
++         *  task: it can afford to wait, and no HTTP client is blocked by this.
++         *  The lock is held until the task ends (released in the
++         *  constructor's finally block above).
++         */
++        $this->lockRepoExclusive($this->sourceRepoController->getRepoId());
++
++        /**
++         *  Define working directory.
++         *
++         *  For deb repositories, use a stable per-repository path instead of
++         *  the historical REPOS_DIR/temporary-task-<taskId>. Rationale:
++         *  apt-ftparchive's BinCacheDB (packages-<section>-<arch>.db) keys
++         *  every entry by the full package path. If the working directory
++         *  differs between two consecutive snapshots (because taskId is part
++         *  of the path), the previous cache is entirely useless for the new
++         *  run and every package gets reindexed from scratch. Using a stable
++         *  path lets cached entries match hardlinked packages across
++         *  snapshots by inode+mtime+size, so only truly new packages are
++         *  actually indexed. Concurrency on the same repository is already
++         *  serialized via the exclusive advisory lock taken above (see
++         *  Controllers\Task\Execution::lockRepoExclusive()), so this path is
++         *  safe to share.
++         *
++         *  For rpm repositories, the historical per-task path stays: createrepo_c
++         *  with --update reuses metadata via repodata regardless of path.
++         */
++        if ($this->repoController->getPackageType() == 'deb') {
++            $workingDir = File::debBuildDir($this->repoController->getName(), $this->repoController->getDist(), $this->repoController->getSection());
++        } else {
++            $workingDir = REPOS_DIR . '/temporary-task-' . $this->taskId;
++        }
++
++        // Expose the working directory to Metadata\Create::createMetadata()
++        // via the base Execution class field, so it uses the same path we set
++        // up here (and the same one the packages get hardlinked into).
++        $this->workingDir = $workingDir;
+ 
+         /**
+          *  Check if a snapshot exists in the database
+@@ -147,18 +192,9 @@
+             throw new Exception('Previous snapshot directory does not exist: ' . $previousSnapshotDir);
+         }
+ 
+-        /**
+-         *  Wait for any in-progress package upload on the source repository to
+-         *  finish before reading the previous snapshot directory. Uploads write
+-         *  straight into that directory, so reading/hardlinking it while a big
+-         *  package is still being moved could miss files or fail on a package
+-         *  removed mid-flight (overwrite). This is a background task: it can
+-         *  afford to wait, and no HTTP client is blocked by this.
+-         */
+-        File::waitRepoIdle($this->sourceRepoController->getRepoId(), function () {
+-            $this->taskLogSubStepController->new('waiting-uploads', 'WAITING FOR ACTIVE UPLOADS TO FINISH');
+-            $this->taskLogSubStepController->completed();
+-        });
++        // Remember it for createMetadata(), which will reuse its metadata
++        // cache instead of reindexing every package from scratch
++        $this->previousSnapshotDir = $previousSnapshotDir;
+ 
+         /**
+          *  If working directory already exists, delete it
+@@ -169,6 +205,9 @@
+             }
+         }
+ 
++        // Mark the current substep ('waiting-repo-lock' if we had to wait for
++        // the lock, 'initializing' otherwise) as completed only now that the
++        // lock has actually been acquired
+         $this->taskLogSubStepController->completed();
+         $this->taskLogSubStepController->new('search-packages', 'SEARCHING PACKAGES IN PREVIOUS SNAPSHOT');
+ 
+--- a/www/controllers/Task/Execution.php
++++ b/www/controllers/Task/Execution.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Controllers\Task;
+ 
++use Controllers\Filesystem\File;
+ use Controllers\Utils\Convert;
+ use Exception;
+ use JsonException;
+@@ -30,6 +31,36 @@
+     protected string $timeStart;
+     protected array $task;
+     protected array $params;
++    /**
++     *  Path to the previous snapshot directory, when relevant for the running
++     *  task (currently only set by Update::updateLocal()). Used by
++     *  \Controllers\Repo\Metadata\Create to reuse the previous snapshot's
++     *  metadata cache (deb: apt-ftparchive BinCacheDB, rpm: createrepo_c
++     *  --update) instead of reindexing every package from scratch. Stays null
++     *  for tasks/actions that have no previous snapshot to reuse.
++     */
++    protected ?string $previousSnapshotDir = null;
++    /**
++     *  Working directory the metadata generator (apt-ftparchive, createrepo_c)
++     *  runs against. Stays null to keep the historical per-task directory
++     *  REPOS_DIR/temporary-task-<taskId>. When set (by Update::updateLocal()
++     *  for deb repositories), the metadata generator works against this
++     *  stable, per-repository path instead. This is needed because
++     *  apt-ftparchive's BinCacheDB keys entries by the absolute file path:
++     *  reusing a per-task path across snapshots would invalidate every cache
++     *  entry (path changes on every run). Using a stable path lets the cache
++     *  match hardlinked packages by inode+mtime+size across snapshots.
++     */
++    protected ?string $workingDir = null;
++    /**
++     *  Exclusive advisory lock on a repository, taken by lockRepoExclusive()
++     *  and held until releaseRepoLock() is called. Centralizing the handle
++     *  and its acquisition/release here (instead of duplicating the same
++     *  property, callback and finally-block unlock in every snapshot task)
++     *  avoids a forgotten unlockRepo() call in any of them.
++     *  @var resource|null
++     */
++    protected $repoLockHandle = null;
+ 
+     public function __construct(int $taskId, string $action)
+     {
+@@ -294,10 +325,45 @@
+     }
+ 
+     /**
++     *  Wait for any in-progress upload or other snapshot task on the given
++     *  repository to finish, then hold the exclusive lock on it until
++     *  releaseRepoLock() is called (end() does this automatically). This
++     *  serializes snapshot tasks (create/update/rebuild/duplicate) on the
++     *  same repository and also blocks uploads from starting while one is
++     *  running. This is meant to be called by background tasks only, never
++     *  from a web request: a task can afford to wait, and no HTTP client
++     *  times out here.
++     *
++     *  @param int $repoId Id of the repository to lock
++     */
++    protected function lockRepoExclusive(int $repoId) : void
++    {
++        $this->repoLockHandle = File::waitAndLockRepoExclusive($repoId, function () {
++            $this->taskLogSubStepController->new('waiting-repo-lock', 'WAITING FOR REPOSITORY LOCK');
++        });
++    }
++
++    /**
++     *  Release the lock taken by lockRepoExclusive(), if any. Safe to call
++     *  even when no lock was taken (e.g. task ended before reaching the
++     *  lockRepoExclusive() call).
++     */
++    protected function releaseRepoLock() : void
++    {
++        File::unlockRepo($this->repoLockHandle);
++        $this->repoLockHandle = null;
++    }
++
++    /**
+      *  End task execution
+      */
+     public function end() : void
+     {
++        // Release the repository lock (if any was taken via lockRepoExclusive())
++        // before anything else, so a concurrent snapshot task waiting for it
++        // can proceed right away
++        $this->releaseRepoLock();
++
+         /**
+          *  Set task status
+          */
+--- a/www/controllers/Repo/Task/Delete.php
++++ b/www/controllers/Repo/Task/Delete.php
+@@ -3,6 +3,7 @@
+ namespace Controllers\Repo\Task;
+ 
+ use Controllers\Filesystem\Directory;
++use Controllers\Filesystem\File;
+ use Exception;
+ 
+ class Delete extends \Controllers\Task\Execution
+@@ -40,6 +41,16 @@
+         $this->taskLogStepController->new('deleting', 'DELETING');
+         $this->taskLogSubStepController->new('deleting', 'DELETING REPOSITORY SNAPSHOT');
+ 
++        /**
++         *  Wait for any in-progress upload or other snapshot task on this
++         *  repository to finish, then hold the exclusive lock until this task
++         *  ends: we are about to remove the snapshot directory that another
++         *  snapshot task (Duplicate/Update/Rebuild) might currently be
++         *  reading. This is a background task: it can afford to wait, and no
++         *  HTTP client is blocked by this.
++         */
++        $this->lockRepoExclusive($this->repoController->getRepoId());
++
+         // Check that repository snapshot still exists
+         if (!$this->repoController->existsSnapId($this->repoController->getSnapId())) {
+             throw new Exception('<span class="label-black">' . $this->repoController->getDateFormatted() . '</span> repository snapshot does not exist anymore');
+@@ -128,6 +139,32 @@
+             ]);
+         }
+ 
++        /**
++         *  If this was the last active snapshot of this deb repository, clean
++         *  up the stable build directory (see Update::updateLocal()) so it
++         *  does not linger on disk indefinitely for a repository that no
++         *  longer exists. The snapshot itself has already been deleted above
++         *  (and its database status updated), so a failure to clean up this
++         *  secondary cache directory is only logged as a warning instead of
++         *  failing the whole task.
++         */
++        if ($this->repoController->getPackageType() == 'deb') {
++            if (!$this->debRepoController->isActive($this->repoController->getName(), $this->repoController->getDist(), $this->repoController->getSection())) {
++                $buildDir = File::debBuildDir($this->repoController->getName(), $this->repoController->getDist(), $this->repoController->getSection());
++
++                if (is_dir($buildDir)) {
++                    if (!Directory::deleteRecursive($buildDir)) {
++                        $this->taskLogSubStepController->warning('Cannot delete stable build directory: ' . $buildDir);
++                    }
++                }
++
++                Directory::deleteIfEmpty([
++                    REPOS_DIR . '/.build/deb/' . $this->repoController->getName() . '/' . $this->repoController->getDist(),
++                    REPOS_DIR . '/.build/deb/' . $this->repoController->getName()
++                ]);
++            }
++        }
++
+         $this->taskLogSubStepController->completed();
+         $this->taskLogStepController->completed();
+     }
+--- a/www/controllers/Repo/Task/Rename.php
++++ b/www/controllers/Repo/Task/Rename.php
+@@ -3,6 +3,7 @@
+ namespace Controllers\Repo\Task;
+ 
+ use Controllers\Filesystem\Directory;
++use Controllers\Filesystem\File;
+ use Exception;
+ 
+ class Rename extends \Controllers\Task\Execution
+@@ -26,7 +27,7 @@
+             // Throw back the exception to be caught by the main script
+             throw new Exception($e->getMessage());
+         } finally {
+-            // End the task
++            // End the task (also releases the repository lock, if any was taken)
+             $this->end();
+         }
+     }
+@@ -39,6 +40,16 @@
+         $this->taskLogStepController->new('renaming', 'RENAMING');
+         $this->taskLogSubStepController->new('renaming-directory', 'RENAMING REPOSITORY DIRECTORY');
+ 
++        /**
++         *  Wait for any in-progress upload or other snapshot task on the
++         *  source repository to finish, then hold the exclusive lock until
++         *  this task ends: we are about to move its snapshot directory on
++         *  disk, which another snapshot task (Duplicate/Update/Rebuild) might
++         *  currently be reading. This is a background task: it can afford to
++         *  wait, and no HTTP client is blocked by this.
++         */
++        $this->lockRepoExclusive($this->sourceRepoController->getRepoId());
++
+         // Check if source repo snapshot exists
+         if ($this->sourceRepoController->existsSnapId($this->sourceRepoController->getSnapId()) === false) {
+             throw new Exception('Source repository snapshot does not exist');
+@@ -93,6 +104,30 @@
+             throw new Exception('Cannot rename source repository ' . $sourcePath . ' to ' . $targetPath);
+         }
+ 
++        /**
++         *  The renamed repository no longer matches the stable build
++         *  directory path used by Update::updateLocal() (see
++         *  REPOS_DIR/.build/deb/<name>/<dist>/<section>), so clean it up to
++         *  avoid leaving an orphaned cache directory behind under the old
++         *  name. The repository has already been renamed above, so a failure
++         *  to clean up this secondary cache directory is only logged as a
++         *  warning instead of failing the whole task.
++         */
++        if ($this->sourceRepoController->getPackageType() == 'deb') {
++            $oldBuildDir = File::debBuildDir($this->sourceRepoController->getName(), $this->sourceRepoController->getDist(), $this->sourceRepoController->getSection());
++
++            if (is_dir($oldBuildDir)) {
++                if (!Directory::deleteRecursive($oldBuildDir)) {
++                    $this->taskLogSubStepController->warning('Cannot delete stable build directory: ' . $oldBuildDir);
++                }
++            }
++
++            Directory::deleteIfEmpty([
++                REPOS_DIR . '/.build/deb/' . $this->sourceRepoController->getName() . '/' . $this->sourceRepoController->getDist(),
++                REPOS_DIR . '/.build/deb/' . $this->sourceRepoController->getName()
++            ]);
++        }
++
+         $this->taskLogSubStepController->completed();
+         $this->taskLogStepController->completed();
