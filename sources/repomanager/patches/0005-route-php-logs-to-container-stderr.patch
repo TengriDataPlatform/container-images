@@ -1,3 +1,13 @@
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -42,6 +42,7 @@
+ ARG WWW_DIR="/var/www/repomanager"
+ ARG DATA_DIR="/var/lib/repomanager"
+ ARG REPOS_DIR="/home/repo"
++ARG PHP_VERSION="8.4"
+ ARG branch=main
+ 
+ # SERVICES CONFIG
 --- a/docker/config/php/php.ini
 +++ b/docker/config/php/php.ini
 @@ -605,6 +605,8 @@
