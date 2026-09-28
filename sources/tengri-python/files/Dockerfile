@@ -1,5 +1,5 @@
 # cspell:ignore libltdl libkrb libkrb libgssapi
-FROM python:3.13-slim AS python-env
+FROM mirror.gcr.io/python:3.13-slim AS python-env
 ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
   --no-install-recommends gcc g++ git ssh libltdl7 libkrb5-3 libgssapi-krb5-2 && rm \
