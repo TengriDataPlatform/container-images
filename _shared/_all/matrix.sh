@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 set -ueo pipefail
 # shellcheck disable=1091
-MY_BIN="$(readlink -f "$0")"
-MY_PATH="$(dirname "${MY_BIN}")"
+MY_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
-source "${MY_PATH}/vars.sh" || source "_shared/_all/vars.sh"
+source "${MY_PATH}/vars.sh"
 DIR_SON='['
 # shellcheck disable=2153
 for dir in "${IMAGES_DIRS[@]}"; do
