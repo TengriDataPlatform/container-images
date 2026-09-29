@@ -132,11 +132,12 @@
  
 --- a/www/controllers/Repo/Metadata/Deb.php
 +++ b/www/controllers/Repo/Metadata/Deb.php
-@@ -16,12 +16,31 @@
+@@ -16,12 +16,32 @@
      private $gpgSign = false;
      private $aptftparchive = '/usr/bin/apt-ftparchive';
      private $customFields = [];
 +    private $previousSnapshotPath = null;
++    private $previousCacheReused = false;
  
      public function setRoot(string $root): void
      {
@@ -164,7 +165,7 @@
      public function setRepo(string $repo): void
      {
          $this->repo = $repo;
-@@ -94,11 +113,24 @@
+@@ -94,11 +114,24 @@
  
          /**
           *  First, clean all of these directories if they already exist (.e.g if the repository is being rebuilt or it is a duplicate of another one)
@@ -192,7 +193,7 @@
                  continue;
              }
  
-@@ -119,6 +151,45 @@
+@@ -119,6 +152,49 @@
              }
          }
  
@@ -210,7 +211,9 @@
 +         *  into the new working directory so that apt-ftparchive's in-place
 +         *  BerkeleyDB writes never touch the previous snapshot's own cache.
 +         *  Best-effort: if copying fails for any reason, apt-ftparchive just
-+         *  falls back to indexing everything.
++         *  falls back to indexing everything. Entries of packages that are not
++         *  carried over are dropped once metadata is generated (see the
++         *  'apt-ftparchive clean' call below).
 +         */
 +        if (!empty($this->previousSnapshotPath) and is_dir($this->previousSnapshotPath . '/cache')) {
 +            $previousCacheFiles = glob($this->previousSnapshotPath . '/cache/packages-*.db');
@@ -228,6 +231,8 @@
 +                        // fail instead of falling back to full reindexing
 +                        @unlink($targetCacheFile);
 +                        $this->taskLogSubStepController->warning('Could not reuse previous metadata cache file ' . $previousCacheFile . ', metadata will be fully regenerated');
++                    } else {
++                        $this->previousCacheReused = true;
 +                    }
 +                }
 +            }
@@ -238,7 +243,7 @@
          // Create apt-ftparchive.conf file
          if (!file_put_contents($this->root . '/apt-ftparchive.conf', $this->generateAptFtpArchiveConf())) {
              throw new Exception('Failed to create apt-ftparchive.conf file');
-@@ -130,7 +201,7 @@
+@@ -130,7 +206,7 @@
          }
  
          // Create Packages file
@@ -247,6 +252,52 @@
          $myprocess->setBackground(true);
          $myprocess->execute();
  
+@@ -167,6 +243,45 @@
+ 
+         $myprocess->close();
+ 
++        /**
++         *  Drop stale entries from the BinCacheDB reused from the previous
++         *  snapshot. The copied cache still holds entries for packages that
++         *  were not carried over to this snapshot (old versions skipped by
++         *  'keep-latest', packages removed from the previous snapshot, entries
++         *  keyed by temporary-task-<taskId> paths, etc.): 'generate' never
++         *  removes them, so they would be copied again into every next
++         *  snapshot. 'clean' deletes every entry whose file no longer exists,
++         *  so it must run here, before the working directory gets renamed to
++         *  the snapshot path (see createMetadata()), while carried over
++         *  packages still exist at the absolute paths their entries are keyed
++         *  by. Entries keyed by paths of other snapshots that still exist
++         *  (e.g. recorded by a rebuild, which runs against the snapshot
++         *  directory itself) are kept until those snapshots get deleted.
++         *  Only done when a previous cache was actually reused: on a rebuild
++         *  the cache holds entries keyed by the stable build directory, which
++         *  does not exist at that point but is needed again by the next update.
++         *  Best-effort: a failure only leaves stale entries in the cache.
++         */
++        if ($this->previousCacheReused) {
++            $myprocess = new Process($this->aptftparchive . ' clean ' . $this->root . '/apt-ftparchive.conf');
++            $myprocess->setBackground(true);
++            $myprocess->execute();
++
++            // Retrieve PID of the launched process, then write PID to main PID file
++            $this->taskController->addsubpid($myprocess->getPid());
++
++            // Retrieve output from process
++            $output = $myprocess->getOutput();
++
++            $this->taskLogSubStepController->output($output, 'pre');
++
++            if ($myprocess->getExitCode() != 0) {
++                $this->taskLogSubStepController->warning('Could not clean stale entries from the metadata cache, they will be kept');
++            }
++
++            $myprocess->close();
++        }
++
+         // Clean configuration files
+         if (file_exists($this->root . '/apt-ftparchive.conf')) {
+             if (!unlink($this->root . '/apt-ftparchive.conf')) {
 --- a/www/controllers/Repo/Metadata/Rpm.php
 +++ b/www/controllers/Repo/Metadata/Rpm.php
 @@ -10,6 +10,7 @@
