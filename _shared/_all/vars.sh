@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -ueo pipefail
-: "${TARGET_REGISTRY:=ghcr.io/tengridataplatform/container-images}"
+: "${TARGET_REGISTRY:=ghcr.io/tengridataplatform}"
+MY_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${MY_PATH}/lib.sh"
 # MANUAL_IMAGES_DIRS='docker-alpine/ systemd-ubuntu-22_04/' ./build.sh for manual build
 : "${MANUAL_IMAGES_DIRS:=}"
 /usr/bin/env printf "\n———⟨ environment: ⟩———\n"
@@ -14,48 +17,6 @@ set
     /usr/bin/env apk update && /usr/bin/env apk add git
   fi
 
-# Resolve diff lines for the current event. Honors MANUAL_DIFF for local runs.
-_diff_lines() {
-  if [[ -n "${MANUAL_DIFF:-}" ]]; then
-    /usr/bin/env printf '%s\n' "${MANUAL_DIFF}"
-    return
-  fi
-  local _before
-  case "${GITHUB_EVENT_NAME:-${CI_PIPELINE_SOURCE:-}}" in
-  push)
-    _before="${GITHUB_EVENT_BEFORE:-${CI_COMMIT_BEFORE_SHA:-}}"
-    # null SHA means first push to branch or force-push; fall back to HEAD^1
-    if [[ -z "${_before}" ]] || [[ "${_before}" =~ ^0+$ ]]; then
-      _before='HEAD^1'
-    fi
-    /usr/bin/env git diff --name-only \
-      "${_before}" "${GITHUB_SHA:-${CI_COMMIT_SHA:-HEAD}}" 2>/dev/null || true
-    ;;
-  pull_request)
-    /usr/bin/env git diff --name-only \
-      "remotes/origin/${GITHUB_BASE_REF:-master}"...HEAD 2>/dev/null || true
-    ;;
-  merge_request_event)
-    /usr/bin/env git diff --name-only \
-      "remotes/origin/${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME}" \
-      "remotes/origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}" 2>/dev/null || true
-    ;;
-  *)
-    # local invocation: compare working tree to HEAD
-    /usr/bin/env git diff --name-only HEAD 2>/dev/null || true
-    ;;
-  esac
-}
-
-# Fill IMAGES_DIRS with every directory under sources/.
-_fill_all_images() {
-  IMAGES_DIRS=()
-  for _dir in sources/*/; do
-    [[ -d "${_dir}" ]] && IMAGES_DIRS+=("${_dir%/}")
-  done
-}
-
-MY_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${MY_PATH}/../vars.sh"
 
@@ -89,26 +50,13 @@ else
         picked["sources/${BASH_REMATCH[1]}"]=1
       fi
     done <<<"${diff}"
-    # transitive hits via SHARED_ASSETS: source each vars.sh in a subshell
-    # with side-effect commands neutralized via _build_vars_shunts
+    # transitive hits via SHARED_ASSETS: source each vars.sh with PUSHING set
+    # so manifests expose metadata without changing the working tree
     for _dir in sources/*/; do
       [[ -f "${_dir}vars.sh" ]] || continue
       _image="${_dir%/}"
       [[ -n "${picked[${_image}]:-}" ]] && continue
-      _assets="$(
-        eval "$(_build_vars_shunts "${_dir}vars.sh")"
-        # shellcheck disable=2034
-        TAG="${_image#sources/}"
-        IMAGE_DIR="${_image}"
-        SHARED_ASSETS=()
-        # PUSHING=1 disables patch application and other push-guarded
-        # side effects while we only need to read SHARED_ASSETS
-        # shellcheck disable=2034
-        PUSHING=1
-        # shellcheck disable=1090
-        source "${_dir}vars.sh" 2>/dev/null || true
-        /usr/bin/env printf '%s\n' "${SHARED_ASSETS[@]:-}"
-      )"
+      _assets="$(_probe_vars "${_image}" assets)"
       [[ -z "${_assets}" ]] && continue
       _hit=0
       while IFS= read -r _entry; do

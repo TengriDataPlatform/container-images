@@ -1,0 +1,381 @@
+--- a/www/config/service-units.php
++++ b/www/config/service-units.php
+@@ -103,6 +103,18 @@
+         'time' => '01:00',
+         'log-dir' => 'db/maintenance'
+     ],
++    // This regenerates from scratch the apt-ftparchive metadata cache of the latest snapshot of every local deb repository every wednesday at 01:11 UTC
++    'deb-cache-regenerate' => [
++        'title' => 'Deb metadata cache regeneration',
++        'description' => 'Regenerates from scratch the apt-ftparchive metadata cache (packages-*.db) of the latest snapshot of every local deb repository, every wednesday at 01:11 UTC',
++        'controller' => 'Service\Unit\DebCacheRegenerate',
++        'method' => 'run',
++        'frequency' => 'every-week',
++        'day' => 'wednesday',
++        'time' => '01:11',
++        'timezone' => 'UTC',
++        'log-dir' => 'deb-cache/regenerate'
++    ],
+     // This executes scheduled tasks every minute
+     'scheduled-tasks-exec' => [
+         'title' => 'Scheduled tasks',
+--- a/www/controllers/Repo/Metadata/Deb.php
++++ b/www/controllers/Repo/Metadata/Deb.php
+@@ -277,14 +277,27 @@
+      */
+     private function generateAptFtpArchiveConf(): string
+     {
++        return self::aptFtpArchiveConf($this->root, $this->dist, $this->section, $this->arch);
++    }
++
++    /**
++     *  Return apt-ftparchive.conf content for the given repository root,
++     *  dist, section and architectures. Public and static so that the deb
++     *  metadata cache regeneration service unit (see
++     *  Controllers\Service\Unit\DebCacheRegenerate) generates exactly the
++     *  same BinCacheDB files, keyed by the same package paths, as a snapshot
++     *  update does.
++     */
++    public static function aptFtpArchiveConf(string $root, string $dist, string $section, array $arch): string
++    {
+         $architectures = '';
+ 
+         // Generate architectures string
+-        foreach ($this->arch as $arch) {
+-            if ($arch == 'src') {
++        foreach ($arch as $currentArch) {
++            if ($currentArch == 'src') {
+                 $architectures .= 'source ';
+             } else {
+-                $architectures .= $arch . ' ';
++                $architectures .= $currentArch . ' ';
+             }
+         }
+ 
+@@ -299,8 +312,8 @@
+          */
+         $template = <<<EOT
+         Dir {
+-            ArchiveDir "$this->root";
+-            CacheDir "$this->root/cache";
++            ArchiveDir "$root";
++            CacheDir "$root/cache";
+         };
+         Default {
+             Packages::Compress ". gzip bzip2";
+@@ -316,8 +329,8 @@
+             Contents "$(DIST)/Contents-$(ARCH)";
+             BinCacheDB "packages-$(SECTION)-$(ARCH).db";
+         };
+-        Tree "dists/$this->dist" {
+-            Sections "$this->section";
++        Tree "dists/$dist" {
++            Sections "$section";
+             Architectures "$architectures";
+         }
+         EOT;
+--- a/www/controllers/Service/Unit/DebCacheRegenerate.php
++++ b/www/controllers/Service/Unit/DebCacheRegenerate.php
+@@ -0,0 +1,277 @@
++<?php
++
++namespace Controllers\Service\Unit;
++
++use Controllers\Filesystem\Directory;
++use Controllers\Filesystem\File;
++use Controllers\Process;
++use Controllers\Repo\Metadata\Deb as DebMetadata;
++use Exception;
++
++class DebCacheRegenerate extends \Controllers\Service\Service
++{
++    private $aptftparchive = '/usr/bin/apt-ftparchive';
++    private $repoListingController;
++
++    public function __construct(string $unit)
++    {
++        parent::__construct($unit);
++
++        $this->repoListingController = new \Controllers\Repo\Listing();
++    }
++
++    /**
++     *  Regenerate from scratch the apt-ftparchive BinCacheDB files
++     *  (cache/packages-*.db) of the latest snapshot of every local deb
++     *  repository.
++     *
++     *  Snapshot updates reuse the cache of the latest snapshot (see
++     *  Update::updateLocal() and Metadata\Deb::create()), so it is carried
++     *  from snapshot to snapshot: entries of packages that are not carried
++     *  over anymore are never removed, and a cache damaged once (e.g. by a
++     *  task killed while apt-ftparchive was writing it) stays damaged in
++     *  every following snapshot. Rebuilding it from scratch on a regular
++     *  basis bounds both problems, while daytime updates keep reusing it.
++     *
++     *  Nothing is published: Packages, Release and signatures of the
++     *  snapshot are left untouched, only its cache directory is replaced.
++     */
++    public function run() : void
++    {
++        // Packages are copied instead of hardlinked by updates when deduplication
++        // is disabled: their mtime changes, so the cache never gets any hit anyway
++        if (!REPO_DEDUPLICATION) {
++            parent::log('Repository deduplication is disabled, the metadata cache is never reused, nothing to do');
++            return;
++        }
++
++        /**
++         *  Make sure only one regeneration runs at a time (e.g. if the unit is
++         *  also started manually from the command line): two of them would
++         *  share the same stable build directory of a repository.
++         */
++        $lockDir = REPOS_DIR . '/.locks';
++
++        if (!is_dir($lockDir)) {
++            // Suppress errors: a concurrent process may create it at the same time
++            @mkdir($lockDir, 0770, true);
++        }
++
++        $runLock = @fopen($lockDir . '/deb-cache-regenerate.lock', 'c');
++
++        if ($runLock === false) {
++            throw new Exception('Could not open lock file ' . $lockDir . '/deb-cache-regenerate.lock');
++        }
++
++        if (!flock($runLock, LOCK_EX | LOCK_NB)) {
++            fclose($runLock);
++            parent::log('Another metadata cache regeneration is already running, nothing to do');
++            return;
++        }
++
++        try {
++            foreach ($this->repoListingController->listNameOnly(true) as $repo) {
++                if ($repo['Package_type'] != 'deb') {
++                    continue;
++                }
++
++                // A failure on a repository leaves its cache as it was and must not prevent the other ones from being regenerated
++                try {
++                    $this->regenerate((int) $repo['Id']);
++                } catch (Exception $e) {
++                    parent::logError('Could not regenerate metadata cache of repository ' . $repo['Name'] . '/' . $repo['Dist'] . '/' . $repo['Section'] . ': ' . $e->getMessage());
++                }
++            }
++        } finally {
++            flock($runLock, LOCK_UN);
++            fclose($runLock);
++        }
++    }
++
++    /**
++     *  Regenerate the metadata cache of the latest snapshot of a deb repository
++     */
++    private function regenerate(int $repoId) : void
++    {
++        /**
++         *  Hold the shared repository lock for the whole regeneration: uploads
++         *  (shared lock too) keep working, while snapshot tasks (exclusive
++         *  lock) wait until the new cache is in place. Update, rebuild,
++         *  duplicate, delete, rename and environment changes (retention
++         *  cleanup) all take the exclusive lock, so none of them can use the
++         *  stable build directory, read the cache that is being replaced or
++         *  delete the snapshot meanwhile.
++         */
++        $lock = File::lockRepoShared($repoId);
++
++        if ($lock === null) {
++            throw new Exception('could not lock the repository');
++        }
++
++        try {
++            // Retrieve the latest snapshot only now that the lock is held: a
++            // snapshot task that was running meanwhile may have created a newer one
++            $repoController = new \Controllers\Repo\Repo();
++            $snapId = $repoController->getLatestSnapId($repoId);
++
++            if (empty($snapId)) {
++                return;
++            }
++
++            $repoController->getAllById(null, $snapId, null);
++
++            // Only local repositories reuse the metadata cache (see Update::updateLocal())
++            if ($repoController->getType() != 'local') {
++                return;
++            }
++
++            $name = $repoController->getName();
++            $dist = $repoController->getDist();
++            $section = $repoController->getSection();
++            $arch = $repoController->getArch();
++            $label = $name . '/' . $dist . '/' . $section . ' (snapshot ' . $repoController->getSnapshotName() . ')';
++
++            if (empty($arch)) {
++                parent::log('No architecture defined for ' . $label . ', skipping');
++                return;
++            }
++
++            $snapshotDir = REPOS_DIR . '/deb/' . $name . '/' . $dist . '/' . $section . '/' . $repoController->getSnapshotName();
++            $workingDir = File::debBuildDir($name, $dist, $section);
++            $newCacheDir = $snapshotDir . '/.cache-regenerate-new';
++            $oldCacheDir = $snapshotDir . '/.cache-regenerate-old';
++
++            if (!is_dir($snapshotDir)) {
++                throw new Exception('snapshot directory does not exist: ' . $snapshotDir);
++            }
++
++            parent::log('Regenerating metadata cache of ' . $label);
++
++            // A previous run killed in the middle of the cache swap left the
++            // snapshot without a cache: put the previous one back first
++            if (!is_dir($snapshotDir . '/cache') and is_dir($oldCacheDir)) {
++                if (!rename($oldCacheDir, $snapshotDir . '/cache')) {
++                    throw new Exception('cannot restore the previous cache from ' . $oldCacheDir);
++                }
++            }
++
++            // Remove leftovers of a previous run or of an interrupted update
++            foreach ([$workingDir, $newCacheDir, $oldCacheDir] as $dir) {
++                if (is_dir($dir) and !Directory::deleteRecursive($dir)) {
++                    throw new Exception('cannot delete existing directory: ' . $dir);
++                }
++            }
++
++            /**
++             *  Create the same directory structure as Metadata\Deb::create()
++             *  in the stable build directory. The cache is generated there
++             *  because BinCacheDB keys every entry by the absolute package
++             *  path: it must be the path the next update hardlinks the
++             *  packages to.
++             */
++            $dirs = [
++                'dists/' . $dist . '/' . $section,
++                'pool/' . $section,
++                'cache'
++            ];
++
++            foreach ($arch as $currentArch) {
++                if ($currentArch == 'src') {
++                    $dirs[] = 'dists/' . $dist . '/' . $section . '/source';
++                } else {
++                    $dirs[] = 'dists/' . $dist . '/' . $section . '/binary-' . $currentArch;
++                }
++            }
++
++            foreach ($dirs as $dir) {
++                if (!is_dir($workingDir . '/' . $dir) and !mkdir($workingDir . '/' . $dir, 0770, true)) {
++                    throw new Exception('cannot create directory: ' . $workingDir . '/' . $dir);
++                }
++            }
++
++            // Hardlink the snapshot packages exactly like Update::updateLocal()
++            // does, so that paths, inodes, mtimes and sizes match the next update
++            $packages = [];
++
++            if (is_dir($snapshotDir . '/pool/' . $section)) {
++                $packages = File::findRecursive($snapshotDir . '/pool/' . $section, [], ['deb', 'dsc', 'gz', 'xz']);
++            }
++
++            foreach ($packages as $packagePath) {
++                if (!@link($packagePath, $workingDir . '/pool/' . $section . '/' . basename($packagePath))) {
++                    // A package removed meanwhile by an upload (overwrite) is just not cached
++                    if (!file_exists($packagePath)) {
++                        continue;
++                    }
++
++                    throw new Exception('cannot create hard link to package: ' . $packagePath);
++                }
++            }
++
++            if (!file_put_contents($workingDir . '/apt-ftparchive.conf', DebMetadata::aptFtpArchiveConf($workingDir, $dist, $section, $arch))) {
++                throw new Exception('cannot create ' . $workingDir . '/apt-ftparchive.conf file');
++            }
++
++            // Same command as Metadata\Deb::create(), against an empty cache
++            $myprocess = new Process($this->aptftparchive . ' -o APT::FTPArchive::AlwaysStat=true generate ' . $workingDir . '/apt-ftparchive.conf');
++            $myprocess->setBackground(true);
++            $myprocess->execute();
++            $output = $myprocess->getOutput();
++            $exitCode = $myprocess->getExitCode();
++            $myprocess->close();
++
++            parent::log($output);
++
++            // apt-ftparchive may report database errors and still exit with 0
++            if ($exitCode != 0 or preg_match('/^E: /m', $output)) {
++                throw new Exception('apt-ftparchive generate failed');
++            }
++
++            if (empty(glob($workingDir . '/cache/packages-*.db'))) {
++                throw new Exception('apt-ftparchive generate did not create any cache file');
++            }
++
++            /**
++             *  Stage the new cache inside the snapshot directory first (same
++             *  filesystem as the stable build directory, like the rename done
++             *  by Metadata\Create::createMetadata()), then swap it with the
++             *  current one. If the process gets killed between the renames,
++             *  the snapshot is only left without a cache: the next update
++             *  then indexes every package once, and the next run of this unit
++             *  puts the previous cache back and removes the staging directory.
++             */
++            if (!rename($workingDir . '/cache', $newCacheDir)) {
++                throw new Exception('cannot move the new cache to ' . $newCacheDir);
++            }
++
++            File::recursiveChmod($newCacheDir, 'dir', 770);
++            File::recursiveChmod($newCacheDir, 'file', 660);
++
++            if (is_dir($snapshotDir . '/cache') and !rename($snapshotDir . '/cache', $oldCacheDir)) {
++                throw new Exception('cannot move the current cache to ' . $oldCacheDir);
++            }
++
++            if (!rename($newCacheDir, $snapshotDir . '/cache')) {
++                // Put the previous cache back, so the snapshot is not left without one
++                if (is_dir($oldCacheDir) and !is_dir($snapshotDir . '/cache')) {
++                    @rename($oldCacheDir, $snapshotDir . '/cache');
++                }
++
++                throw new Exception('cannot move the new cache to ' . $snapshotDir . '/cache');
++            }
++
++            if (is_dir($oldCacheDir) and !Directory::deleteRecursive($oldCacheDir)) {
++                parent::logError('Could not delete the previous metadata cache ' . $oldCacheDir);
++            }
++
++            parent::log('Metadata cache of ' . $label . ' regenerated');
++        } finally {
++            // The build directory only holds hardlinks and unpublished metadata
++            if (isset($workingDir) and is_dir($workingDir) and !Directory::deleteRecursive($workingDir)) {
++                parent::logError('Could not delete build directory ' . $workingDir);
++            }
++
++            File::unlockRepo($lock);
++        }
++    }
++}
+--- a/www/controllers/Service/Unit/Main.php
++++ b/www/controllers/Service/Unit/Main.php
+@@ -2,6 +2,8 @@
+ 
+ namespace Controllers\Service\Unit;
+ 
++use DateTime;
++use DateTimeZone;
+ use Exception;
+ 
+ class Main extends \Controllers\Service\Service
+@@ -82,9 +84,12 @@
+ 
+             /**
+              *  Run tasks scheduled to run every weeks on a specific day at a specific time
++             *  A unit can define the 'timezone' its day and time are expressed in (e.g. 'UTC'), otherwise the application timezone is used
+              */
+             foreach ($units as $unitName => $unit) {
+-                if ($unit['frequency'] == 'every-week' && isset($unit['day']) && $unit['day'] == strtolower(date('l')) && isset($unit['time']) && $unit['time'] == $currentTime) {
++                $unitNow = new DateTime('now', new DateTimeZone($unit['timezone'] ?? date_default_timezone_get()));
++
++                if ($unit['frequency'] == 'every-week' && isset($unit['day']) && $unit['day'] == strtolower($unitNow->format('l')) && isset($unit['time']) && $unit['time'] == $unitNow->format('H:i')) {
+                     // Check if the unit has not already been launched
+                     if (!in_array($unitName, $launchedUnits)) {
+                         $this->runUnit($unit['title'], $unitName, isset($unit['force']) ? $unit['force'] : false);

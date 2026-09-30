@@ -1,0 +1,685 @@
+--- a/www/controllers/Api/Repo/Repo.php
++++ b/www/controllers/Api/Repo/Repo.php
+@@ -4,6 +4,7 @@
+ 
+ use Controllers\Task\Task;
+ use Exception;
++use JsonException;
+ 
+ class Repo extends \Controllers\Api\Controller
+ {
+@@ -88,6 +89,15 @@
+              *                      the freshly created snapshot.
+              *    - description   : optional string.
+              *    - advanced-params : optional array passed through untouched.
++             *    - keep-latest   : optional non-negative integer (or numeric string).
++             *                      Keep only the X latest versions of each package
++             *                      (name + arch) in the new snapshot. Merged into the
++             *                      advanced-params inherited from the latest snapshot
++             *                      (or into the advanced-params provided above), so
++             *                      other advanced params are preserved. 0 disables it.
++             *                      When omitted, the inherited value applies.
++             *                      Not applied when the snapshot is updated in place
++             *                      (no snapshot-name, or the same name as the latest).
+              *
+              *  Returns 202 Accepted with the task Id so the caller can poll status.
+              */
+@@ -170,6 +180,39 @@
+                     $params['advanced-params'] = $this->data['advanced-params'];
+                 }
+ 
++                // Optional keep-latest: merged into the advanced params the task
++                // would otherwise inherit from the latest snapshot (or into the
++                // advanced-params provided above), so the other advanced params
++                // (e.g. metadata-custom-fields) are preserved. 0 disables it.
++                if (isset($this->data['keep-latest'])) {
++                    $keepLatest = $this->data['keep-latest'];
++
++                    if (!(is_int($keepLatest) and $keepLatest >= 0) and !(is_string($keepLatest) and ctype_digit($keepLatest))) {
++                        throw new Exception('Invalid keep-latest value (expected a non-negative integer)');
++                    }
++
++                    if (!isset($params['advanced-params'])) {
++                        $snapController = new \Controllers\Repo\Snapshot\Snapshot();
++                        $snapData = $snapController->getById((int) $latestSnapId);
++
++                        try {
++                            $params['advanced-params'] = json_decode(!empty($snapData['Advanced_params']) ? $snapData['Advanced_params'] : '{}', true, 512, JSON_THROW_ON_ERROR);
++                        } catch (JsonException $e) {
++                            throw new Exception('Failed to decode advanced parameters of snapshot #' . $latestSnapId . ': ' . $e->getMessage());
++                        }
++
++                        if (!is_array($params['advanced-params'])) {
++                            $params['advanced-params'] = [];
++                        }
++                    }
++
++                    if ((int) $keepLatest > 0) {
++                        $params['advanced-params']['packages']['keep-latest'] = (string) (int) $keepLatest;
++                    } else {
++                        unset($params['advanced-params']['packages']['keep-latest']);
++                    }
++                }
++
+                 // Kick off the task in background
+                 $taskController = new Task();
+                 $taskId = $taskController->execute([$params]);
+--- a/www/controllers/Repo/Package/KeepLatest.php
++++ b/www/controllers/Repo/Package/KeepLatest.php
+@@ -0,0 +1,473 @@
++<?php
++
++namespace Controllers\Repo\Package;
++
++use Controllers\Process;
++
++/**
++ *  Select the packages to carry over to a new local repository snapshot,
++ *  keeping only the X latest versions of each package.
++ *
++ *  Packages are grouped by name and architecture. Name, version and
++ *  architecture are first parsed from the standard file name
++ *  (name_version_arch.deb, name-version-release.arch.rpm). When the file name
++ *  does not follow this scheme, they are read from the package headers. When
++ *  both fail, the package is kept as-is and reported as unparsed.
++ *
++ *  Versions are compared with PHP ports of dpkg's verrevcmp() and rpm's
++ *  rpmvercmp(). The epoch is ignored on purpose: it is not part of standard
++ *  file names, so ignoring it keeps both sources comparable.
++ */
++class KeepLatest
++{
++    private $packageType;
++    private $keepLatest;
++    private $kept = [];
++    private $skipped = [];
++    private $unparsed = [];
++    private $headerParsed = [];
++
++    public function __construct(string $packageType, int $keepLatest)
++    {
++        $this->packageType = $packageType;
++        $this->keepLatest = $keepLatest;
++    }
++
++    /**
++     *  Split the specified package paths into kept and skipped ones.
++     *  Files that are not packages of the repository type (e.g. deb sources)
++     *  are always kept. The original order of the kept paths is preserved.
++     */
++    public function filter(array $paths): void
++    {
++        $groups = [];
++        $skipped = [];
++
++        $this->kept = [];
++        $this->skipped = [];
++        $this->unparsed = [];
++        $this->headerParsed = [];
++
++        foreach ($paths as $path) {
++            if (!preg_match('/\.' . $this->packageType . '$/', $path)) {
++                continue;
++            }
++
++            $package = $this->parseFilename(basename($path));
++
++            if ($package === null) {
++                $package = $this->parseHeaders($path);
++
++                if ($package === null) {
++                    $this->unparsed[] = $path;
++                    continue;
++                }
++
++                $this->headerParsed[] = $path;
++            }
++
++            $package['path'] = $path;
++            $groups[$package['name'] . '|' . $package['arch']][] = $package;
++        }
++
++        foreach ($groups as $group) {
++            // Sort from the newest to the oldest version, then by file name so
++            // the result does not depend on the directory listing order
++            usort($group, function ($a, $b) {
++                $result = $this->compareVersions($b['version'], $a['version']);
++
++                if ($result != 0) {
++                    return $result;
++                }
++
++                return strcmp(basename($a['path']), basename($b['path']));
++            });
++
++            // Count distinct versions: several files carrying the same version
++            // are all kept or all skipped together
++            $versions = 0;
++            $previousVersion = null;
++
++            foreach ($group as $package) {
++                if ($previousVersion === null or $this->compareVersions($package['version'], $previousVersion) != 0) {
++                    $versions++;
++                    $previousVersion = $package['version'];
++                }
++
++                if ($versions > $this->keepLatest) {
++                    $skipped[$package['path']] = true;
++                }
++            }
++        }
++
++        foreach ($paths as $path) {
++            if (isset($skipped[$path])) {
++                $this->skipped[] = $path;
++            } else {
++                $this->kept[] = $path;
++            }
++        }
++    }
++
++    /**
++     *  Return the paths to carry over to the new snapshot
++     */
++    public function getKept(): array
++    {
++        return $this->kept;
++    }
++
++    /**
++     *  Return the paths of the old versions that are not carried over
++     */
++    public function getSkipped(): array
++    {
++        return $this->skipped;
++    }
++
++    /**
++     *  Return the paths of the packages whose name, version or architecture
++     *  could be determined neither from the file name nor from the headers
++     */
++    public function getUnparsed(): array
++    {
++        return $this->unparsed;
++    }
++
++    /**
++     *  Return the paths of the packages whose name, version and architecture
++     *  were read from the headers because of a non-standard file name
++     */
++    public function getHeaderParsed(): array
++    {
++        return $this->headerParsed;
++    }
++
++    /**
++     *  Compare two versions of the repository package type.
++     *  Return a negative number, 0 or a positive number.
++     */
++    private function compareVersions(string $a, string $b): int
++    {
++        if ($this->packageType == 'deb') {
++            return self::compareDebVersions($a, $b);
++        }
++
++        return self::compareRpmVersions($a, $b);
++    }
++
++    /**
++     *  Parse name, version and architecture from a standard package file name.
++     *  Return null when the file name does not follow the standard scheme.
++     */
++    private function parseFilename(string $filename): ?array
++    {
++        if ($this->packageType == 'deb') {
++            if (!preg_match('/^([a-z0-9][a-z0-9+.-]*)_([A-Za-z0-9.+~-]+)_([a-z0-9-]+)\.deb$/', $filename, $matches)) {
++                return null;
++            }
++
++            return ['name' => $matches[1], 'version' => $matches[2], 'arch' => $matches[3]];
++        }
++
++        if (!preg_match('/^(.+)-([^-]+)-([^-]+)\.([A-Za-z0-9_]+)\.rpm$/', $filename, $matches)) {
++            return null;
++        }
++
++        return ['name' => $matches[1], 'version' => $matches[2] . '-' . $matches[3], 'arch' => $matches[4]];
++    }
++
++    /**
++     *  Read name, version and architecture from the package headers.
++     *  Return null when the headers cannot be read.
++     */
++    private function parseHeaders(string $path): ?array
++    {
++        if ($this->packageType == 'deb') {
++            $command = '/usr/bin/dpkg-deb --show --showformat=' . escapeshellarg('${Package} ${Version} ${Architecture}\n');
++            $pattern = '/^(\S+) (\S+) (\S+)$/';
++        } else {
++            $command = '/usr/bin/rpm -qp --nosignature --nodigest --queryformat=' . escapeshellarg('%{NAME} %{VERSION} %{RELEASE} %{ARCH} %{SOURCERPM}\n');
++            $pattern = '/^(\S+) (\S+) (\S+) (\S+) (\S+)$/';
++        }
++
++        $myprocess = new Process($command . ' ' . escapeshellarg($path) . ' 2>/dev/null');
++        $myprocess->execute();
++        $output = trim($myprocess->getOutput());
++        $myprocess->close();
++
++        if ($myprocess->getExitCode() != 0 or !preg_match($pattern, $output, $matches)) {
++            return null;
++        }
++
++        if ($this->packageType == 'deb') {
++            // Drop the epoch to stay comparable with versions parsed from file names
++            return ['name' => $matches[1], 'version' => preg_replace('/^[0-9]+:/', '', $matches[2]), 'arch' => $matches[3]];
++        }
++
++        // Source packages have no SOURCERPM and are grouped under the 'src' architecture
++        // like their file names (*.src.rpm) are
++        $arch = $matches[5] == '(none)' ? 'src' : $matches[4];
++
++        return ['name' => $matches[1], 'version' => $matches[2] . '-' . $matches[3], 'arch' => $arch];
++    }
++
++    /**
++     *  Compare two Debian versions ([epoch:]upstream[-revision]) like dpkg does,
++     *  ignoring the epoch. Return a negative number, 0 or a positive number.
++     */
++    public static function compareDebVersions(string $a, string $b): int
++    {
++        $a = preg_replace('/^[0-9]+:/', '', $a);
++        $b = preg_replace('/^[0-9]+:/', '', $b);
++
++        [$upstreamA, $revisionA] = self::splitDebRevision($a);
++        [$upstreamB, $revisionB] = self::splitDebRevision($b);
++
++        $result = self::debVerRevCmp($upstreamA, $upstreamB);
++
++        if ($result != 0) {
++            return $result;
++        }
++
++        return self::debVerRevCmp($revisionA, $revisionB);
++    }
++
++    /**
++     *  Split a Debian version into upstream version and revision
++     */
++    private static function splitDebRevision(string $version): array
++    {
++        $position = strrpos($version, '-');
++
++        if ($position === false) {
++            return [$version, ''];
++        }
++
++        return [substr($version, 0, $position), substr($version, $position + 1)];
++    }
++
++    /**
++     *  Weight of a character in dpkg's version ordering: '~' sorts before
++     *  everything (even the end of the string), then letters, then other characters
++     */
++    private static function debOrder(string $char): int
++    {
++        if ($char === '' or ctype_digit($char)) {
++            return 0;
++        }
++
++        if (ctype_alpha($char)) {
++            return ord($char);
++        }
++
++        if ($char == '~') {
++            return -1;
++        }
++
++        return ord($char) + 256;
++    }
++
++    /**
++     *  Port of dpkg's verrevcmp()
++     */
++    private static function debVerRevCmp(string $a, string $b): int
++    {
++        $lengthA = strlen($a);
++        $lengthB = strlen($b);
++        $i = 0;
++        $j = 0;
++
++        while ($i < $lengthA or $j < $lengthB) {
++            $firstDiff = 0;
++
++            while (($i < $lengthA and !ctype_digit($a[$i])) or ($j < $lengthB and !ctype_digit($b[$j]))) {
++                $orderA = self::debOrder($i < $lengthA ? $a[$i] : '');
++                $orderB = self::debOrder($j < $lengthB ? $b[$j] : '');
++
++                if ($orderA != $orderB) {
++                    return $orderA - $orderB;
++                }
++
++                $i++;
++                $j++;
++            }
++
++            while ($i < $lengthA and $a[$i] == '0') {
++                $i++;
++            }
++
++            while ($j < $lengthB and $b[$j] == '0') {
++                $j++;
++            }
++
++            while ($i < $lengthA and $j < $lengthB and ctype_digit($a[$i]) and ctype_digit($b[$j])) {
++                if ($firstDiff == 0) {
++                    $firstDiff = ord($a[$i]) - ord($b[$j]);
++                }
++
++                $i++;
++                $j++;
++            }
++
++            if ($i < $lengthA and ctype_digit($a[$i])) {
++                return 1;
++            }
++
++            if ($j < $lengthB and ctype_digit($b[$j])) {
++                return -1;
++            }
++
++            if ($firstDiff != 0) {
++                return $firstDiff;
++            }
++        }
++
++        return 0;
++    }
++
++    /**
++     *  Compare two RPM version-release strings like rpm does, ignoring the
++     *  epoch. Return a negative number, 0 or a positive number.
++     */
++    public static function compareRpmVersions(string $a, string $b): int
++    {
++        $a = preg_replace('/^[0-9]+:/', '', $a);
++        $b = preg_replace('/^[0-9]+:/', '', $b);
++
++        [$versionA, $releaseA] = self::splitDebRevision($a);
++        [$versionB, $releaseB] = self::splitDebRevision($b);
++
++        $result = self::rpmVerCmp($versionA, $versionB);
++
++        if ($result != 0) {
++            return $result;
++        }
++
++        return self::rpmVerCmp($releaseA, $releaseB);
++    }
++
++    /**
++     *  Port of rpm's rpmvercmp()
++     */
++    private static function rpmVerCmp(string $a, string $b): int
++    {
++        if ($a === $b) {
++            return 0;
++        }
++
++        $lengthA = strlen($a);
++        $lengthB = strlen($b);
++        $i = 0;
++        $j = 0;
++
++        while ($i < $lengthA or $j < $lengthB) {
++            while ($i < $lengthA and !ctype_alnum($a[$i]) and $a[$i] != '~' and $a[$i] != '^') {
++                $i++;
++            }
++
++            while ($j < $lengthB and !ctype_alnum($b[$j]) and $b[$j] != '~' and $b[$j] != '^') {
++                $j++;
++            }
++
++            // Tilde sorts before everything else
++            $tildeA = ($i < $lengthA and $a[$i] == '~');
++            $tildeB = ($j < $lengthB and $b[$j] == '~');
++
++            if ($tildeA or $tildeB) {
++                if (!$tildeA) {
++                    return 1;
++                }
++
++                if (!$tildeB) {
++                    return -1;
++                }
++
++                $i++;
++                $j++;
++                continue;
++            }
++
++            // Caret sorts after the end of the string but before anything else
++            $caretA = ($i < $lengthA and $a[$i] == '^');
++            $caretB = ($j < $lengthB and $b[$j] == '^');
++
++            if ($caretA or $caretB) {
++                if ($i >= $lengthA) {
++                    return -1;
++                }
++
++                if ($j >= $lengthB) {
++                    return 1;
++                }
++
++                if (!$caretA) {
++                    return 1;
++                }
++
++                if (!$caretB) {
++                    return -1;
++                }
++
++                $i++;
++                $j++;
++                continue;
++            }
++
++            if ($i >= $lengthA or $j >= $lengthB) {
++                break;
++            }
++
++            $startA = $i;
++            $startB = $j;
++            $isNumeric = ctype_digit($a[$i]);
++
++            if ($isNumeric) {
++                while ($i < $lengthA and ctype_digit($a[$i])) {
++                    $i++;
++                }
++
++                while ($j < $lengthB and ctype_digit($b[$j])) {
++                    $j++;
++                }
++            } else {
++                while ($i < $lengthA and ctype_alpha($a[$i])) {
++                    $i++;
++                }
++
++                while ($j < $lengthB and ctype_alpha($b[$j])) {
++                    $j++;
++                }
++            }
++
++            $segmentA = substr($a, $startA, $i - $startA);
++            $segmentB = substr($b, $startB, $j - $startB);
++
++            // Numeric segments are always newer than alpha segments
++            if ($segmentB === '') {
++                return $isNumeric ? 1 : -1;
++            }
++
++            if ($isNumeric) {
++                $segmentA = ltrim($segmentA, '0');
++                $segmentB = ltrim($segmentB, '0');
++
++                if (strlen($segmentA) != strlen($segmentB)) {
++                    return strlen($segmentA) > strlen($segmentB) ? 1 : -1;
++                }
++            }
++
++            $result = strcmp($segmentA, $segmentB);
++
++            if ($result != 0) {
++                return $result > 0 ? 1 : -1;
++            }
++        }
++
++        if ($i >= $lengthA and $j >= $lengthB) {
++            return 0;
++        }
++
++        return $i >= $lengthA ? -1 : 1;
++    }
++}
+--- a/www/controllers/Repo/Task/Update.php
++++ b/www/controllers/Repo/Task/Update.php
+@@ -4,6 +4,7 @@
+ 
+ use Controllers\Filesystem\Directory;
+ use Controllers\Filesystem\File;
++use Controllers\Repo\Package\KeepLatest;
+ use Controllers\Utils\Generate\Html\Label;
+ use Exception;
+ 
+@@ -235,6 +236,55 @@
+         $this->taskLogSubStepController->completed($totalPackages . ' package(s) found');
+ 
+         /**
++         *  Keep only the X latest versions of each package (grouped by name and
++         *  architecture) when 'keep-latest' is set in the advanced parameters.
++         *  Older versions are simply not carried over to the new snapshot: the
++         *  previous snapshots are left untouched, they get removed later by the
++         *  regular snapshot retention (RETENTION setting).
++         *  An in-place update (the new snapshot has the same name as the source
++         *  one, see finalize()) rebuilds the existing snapshot directory, so old
++         *  versions are kept there to never remove packages from an existing
++         *  snapshot.
++         */
++        $keepLatest = (int) ($this->repoController->getAdvancedParams()['packages']['keep-latest'] ?? 0);
++
++        if ($keepLatest > 0 and $this->sourceRepoController->getSnapshotName() == $this->repoController->getSnapshotName()) {
++            $this->taskLogSubStepController->new('keep-latest', 'SKIPPING OLD PACKAGE VERSIONS');
++            $this->taskLogSubStepController->completed('In-place update of an existing snapshot: all versions are kept (keep latest ' . $keepLatest . ' not applied)');
++
++            $keepLatest = 0;
++        }
++
++        if ($keepLatest > 0) {
++            $this->taskLogSubStepController->new('keep-latest', 'SKIPPING OLD PACKAGE VERSIONS');
++
++            $keepLatestController = new KeepLatest($this->repoController->getPackageType(), $keepLatest);
++            $keepLatestController->filter($packages);
++            $packages = $keepLatestController->getKept();
++
++            // List the old versions that are not carried over
++            if (!empty($keepLatestController->getSkipped())) {
++                $this->taskLogSubStepController->output(implode(PHP_EOL, array_map('basename', $keepLatestController->getSkipped())), 'pre');
++            }
++
++            // List the packages whose version was read from the headers because of a non-standard file name
++            if (!empty($keepLatestController->getHeaderParsed())) {
++                $this->taskLogSubStepController->output('Version read from package headers (non-standard file name):');
++                $this->taskLogSubStepController->output(implode(PHP_EOL, array_map('basename', $keepLatestController->getHeaderParsed())), 'pre');
++            }
++
++            // Packages whose name, version or architecture could not be determined are kept as-is
++            if (!empty($keepLatestController->getUnparsed())) {
++                $this->taskLogSubStepController->warning(count($keepLatestController->getUnparsed()) . ' package(s) with unrecognized name, version or architecture kept as-is:');
++                $this->taskLogSubStepController->output(implode(PHP_EOL, array_map('basename', $keepLatestController->getUnparsed())), 'pre');
++            }
++
++            $totalPackages = count($packages);
++
++            $this->taskLogSubStepController->completed(count($keepLatestController->getSkipped()) . ' old version(s) skipped (keep latest ' . $keepLatest . '), ' . $totalPackages . ' package(s) left');
++        }
++
++        /**
+          *  Create target pool/packages directory
+          */
+         if ($this->repoController->getPackageType() == 'deb') {
+--- a/www/controllers/Task/Form/Create.php
++++ b/www/controllers/Task/Form/Create.php
+@@ -62,6 +62,9 @@
+         // If the selected repo type is 'local' we will have to check that a name has been provided (can be left empty in the case of a mirror)
+         if ($formParams['repo-type'] == 'local') {
+             $targetName = $formParams['alias'];
++
++            // Check keep latest versions of packages
++            Param\KeepLatest::check($formParams['advanced-params']['packages']['keep-latest'] ?? '');
+         }
+ 
+         // If the selected repo type is 'mirror' then we check additional parameters
+--- a/www/controllers/Task/Form/Update.php
++++ b/www/controllers/Task/Form/Update.php
+@@ -32,6 +32,11 @@
+         // Check architecture
+         Param\Arch::check($formParams['arch']);
+ 
++        // Case of a local repository, check keep latest versions of packages
++        if ($repoController->getType() == 'local') {
++            Param\KeepLatest::check($formParams['advanced-params']['packages']['keep-latest'] ?? '');
++        }
++
+         // Case of a mirror repository, check additional parameters
+         if ($repoController->getType() == 'mirror') {
+             // Check keep latest versions of packages
+--- a/www/views/includes/forms/tasks/update.inc.php
++++ b/www/views/includes/forms/tasks/update.inc.php
+@@ -90,19 +90,24 @@
+ </label>
+ 
+ <?php
+-if ($repoController->getType() == 'mirror' or ($repoController->getType() == 'local' and $repoController->getPackageType() == 'deb')) : ?>
++if ($repoController->getType() == 'mirror' or $repoController->getType() == 'local') : ?>
+     <div class="flex align-item-center column-gap-5 toggle-btn pointer margin-top-20 mediumopacity" toggle="div#advanced-params-<?= $repoController->getSnapId() ?>">
+         <h6 class="margin-top-0">ADVANCED PARAMETERS</h6>
+         <img src="/assets/icons/next.svg" class="icon toggle-icon" />
+     </div>
+ 
+     <div id="advanced-params-<?= $repoController->getSnapId() ?>" class="hide">
++        <h6>KEEP LATEST x VERSIONS OF PACKAGES</h6>
++        <p class="note">Keep only the latest x versions of packages in the repository. Older versions will be ignored.</p>
+         <?php
+-        if ($repoController->getType() == 'mirror') : ?>
+-            <h6>KEEP LATEST x VERSIONS OF PACKAGES</h6>
+-            <p class="note">Keep only the latest x versions of packages in the repository. Older versions will be ignored.</p>
+-            <input type="number" class="task-param" param-name="advanced-params.packages.keep-latest" package-type="all" min="1" placeholder="e.g. 5" value="<?= $repoController->getAdvancedParams()['packages']['keep-latest'] ?? '' ?>" />
++        if ($repoController->getType() == 'local') : ?>
++            <p class="note">Older versions are not carried over to the new snapshot. Leave empty to keep all versions.</p>
++            <?php
++        endif ?>
++        <input type="number" class="task-param" param-name="advanced-params.packages.keep-latest" package-type="all" min="1" placeholder="e.g. 5" value="<?= $repoController->getAdvancedParams()['packages']['keep-latest'] ?? '' ?>" />
+ 
++        <?php
++        if ($repoController->getType() == 'mirror') : ?>
+             <h6>ONLY INCLUDE PACKAGE(S)</h6>
+             <p class="note">Specify packages names to include. All other packages will be ignored from sync.</p>
+             <p class="note">You can use <code>.*</code> as a wildcard. e.g <code>nginx_1.24.*</code></p>
+--- a/www/views/includes/panels/repos/new.inc.php
++++ b/www/views/includes/panels/repos/new.inc.php
+@@ -216,11 +216,14 @@
+         </div>
+ 
+         <div id="advanced-params" class="hide">
+-            <div field-type="mirror rpm deb">
++            <div field-type="mirror local rpm deb">
+                 <h6>KEEP LATEST x VERSIONS OF PACKAGES</h6>
+                 <p class="note">Keep only the latest x versions of packages in the repository. Older versions will be ignored.</p>
++                <p class="note" field-type="local rpm deb">Older versions are not carried over to new snapshots. Leave empty to keep all versions.</p>
+                 <input type="number" class="task-param" param-name="advanced-params.packages.keep-latest" package-type="all" min="1" placeholder="e.g. 5" />
+-            
++            </div>
++
++            <div field-type="mirror rpm deb">
+                 <h6>ONLY INCLUDE PACKAGE(S)</h6>
+                 <p class="note">Specify packages names to include. All other packages will be ignored from sync.</p>
+                 <p class="note">You can use <code>.*</code> as a wildcard. e.g <code>nginx_1.24.*</code></p>
