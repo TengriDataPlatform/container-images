@@ -342,10 +342,16 @@
              $this->end();
          }
      }
-@@ -37,6 +37,18 @@
+@@ -36,6 +36,25 @@
+      */
      public function execute()
      {
-         /**
++        // A step must exist before waiting for the lock: the waiting callback
++        // adds a 'waiting-repo-lock' substep to the latest step
++        $this->taskLogStepController->new('rebuilding', 'REBUILDING');
++        $this->taskLogSubStepController->new('initializing', 'INITIALIZING');
++
++        /**
 +         *  Wait for any in-progress upload or other snapshot task on this
 +         *  repository to finish, then hold the exclusive lock until this task
 +         *  ends. This is a background task: it can afford to wait, and no
@@ -353,14 +359,15 @@
 +         */
 +        $this->lockRepoExclusive($this->repoController->getRepoId());
 +
-+        // Mark the substep as completed only now that the lock has actually
-+        // been acquired (it was still waiting for it inside the callback above)
++        // Mark the current substep ('waiting-repo-lock' if we had to wait for
++        // the lock, 'initializing' otherwise) as completed only now that the
++        // lock has actually been acquired
 +        $this->taskLogSubStepController->completed();
++        $this->taskLogStepController->completed();
 +
-+        /**
+         /**
           *  Set snapshot metadata rebuild state in database
           */
-         $this->repoSnapshotController->updateRebuild($this->repoController->getSnapId(), 'running');
 --- a/www/controllers/Repo/Task/Update.php
 +++ b/www/controllers/Repo/Task/Update.php
 @@ -33,7 +33,7 @@
@@ -681,3 +688,38 @@
 +
          $this->taskLogSubStepController->completed();
          $this->taskLogStepController->completed();
+ 
+--- a/www/controllers/Repo/Task/Env.php
++++ b/www/controllers/Repo/Task/Env.php
+@@ -179,6 +179,14 @@
+ 
+         $this->taskLogStepController->new('clean', 'CLEANING');
+ 
++        /**
++         *  The retention cleanup below deletes snapshot directories: wait for
++         *  any in-progress upload or snapshot task on this repository to
++         *  finish, then hold the exclusive lock until this task ends, so none
++         *  of them loses a snapshot it is working on
++         */
++        $this->lockRepoExclusive($this->repoController->getRepoId());
++
+         // Clean unused snapshots
+         $this->taskLogSubStepController->new('cleaning-snapshots', 'CLEANING SNAPSHOTS');
+         $this->taskLogSubStepController->completed($this->repoSnapshotController->clean($this->repoController->getRepoId()));
+--- a/www/controllers/Repo/Task/RemoveEnv.php
++++ b/www/controllers/Repo/Task/RemoveEnv.php
+@@ -65,6 +65,14 @@
+         $this->taskLogStepController->completed();
+         $this->taskLogStepController->new('cleaning', 'CLEANING');
+ 
++        /**
++         *  The retention cleanup below deletes snapshot directories: wait for
++         *  any in-progress upload or snapshot task on this repository to
++         *  finish, then hold the exclusive lock until this task ends, so none
++         *  of them loses a snapshot it is working on
++         */
++        $this->lockRepoExclusive($this->repoController->getRepoId());
++
+         // Clean unused snapshots
+         $this->taskLogSubStepController->new('cleaning-snapshots', 'CLEANING SNAPSHOTS');
+         $this->taskLogSubStepController->completed($this->repoSnapshotController->clean($this->repoController->getRepoId()));
