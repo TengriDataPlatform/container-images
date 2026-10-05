@@ -14,7 +14,7 @@ concurrency:
 jobs:
   define-matrix:
     name: define matrix
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       images: ${{ steps.define-matrix.outputs.images }}
     steps:
@@ -68,7 +68,7 @@ jobs:
   MegaLinter:
     name: MegaLinter
     timeout-minutes: 11
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
         with:
@@ -81,7 +81,7 @@ jobs:
   all-green:
     name: all green
     timeout-minutes: 3
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs:
       - containers
       - MegaLinter

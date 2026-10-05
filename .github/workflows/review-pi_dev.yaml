@@ -1,7 +1,9 @@
 ---
+# cspell:ignore postgrespro pideview
 name: AI Pideview
 on:
   # checkov:skip=CKV_GHA_7: dispatch only pipeline
+  # jscpd:ignore-start
   workflow_dispatch:
     inputs:
       llm-api-model:
@@ -21,8 +23,9 @@ permissions:
   pull-requests: write
   issues: write
 jobs:
-  ai-review:
-    runs-on: [self-hosted, debian13, build]
+  review-pi_dev:
+    runs-on: ubuntu-latest
+    name: review pi.dev
     steps:
       - uses: actions/checkout@v7
         with:
@@ -30,12 +33,9 @@ jobs:
           fetch-tags: true
           submodules: recursive
           persist-credentials: false
-      - name: Run AI review
+      - name: Review by pi.dev agent
         uses: megalomania428/github-actions/review-pi_dev@master
         env:
-          HTTP_PROXY: ${{ secrets.PROXY_HTTP }}
-          SOCKS_PROXY: ${{ secrets.PROXY_SOCKS }}
-          NO_PROXY: ".in.tengri-data.ru,.postgrespro.ru,10.128.21.61,localhost,127.0.0.1"
           LLM_URL: ${{ inputs.llm-api-url || secrets.LLM_API_URL }} # gitleaks:allow
           LLM_NAME: "${{ inputs.llm-api-model ||
             secrets.LLM_API_MDL2PI }}" # gitleaks:allow
@@ -46,6 +46,6 @@ jobs:
           SEARCH_MCP_KEY: ${{ secrets.SEARCH_MCP_KEY }}
           FETCH_MCP_URL: ${{ secrets.FETCH_MCP_URL }}
           FETCH_MCP_KEY: ${{ secrets.FETCH_MCP_KEY }}
-          IMAGE: "nexus01.in.tengri-data.ru/cont-ghcr/raven428/review-pi_dev:latest"
         with:
           pr_number: ${{ inputs.pr-number }}
+          # jscpd:ignore-end
