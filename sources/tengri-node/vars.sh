@@ -9,7 +9,8 @@ if [[ -z "${PUSHING:-}" ]]; then
   stage_shared_assets
   _upstream="sources/${TAG}/_shared/upstream"
   _pat="${TENGRI_INFRA_READ_PAT:-}"
-  _repo_url="https://${_pat:+${_pat}@}github.com/TengriDataPlatform/tengri.git"
+  _repo_url="https://${_pat:+x-access-token:${_pat}@}github.com/TengriDataPlatform/\
+tengri.git"
   checkout_upstream "${_repo_url}" master "${_upstream}"
   _dockerfile="${_upstream}/node-env.Dockerfile"
   # shellcheck disable=2153
